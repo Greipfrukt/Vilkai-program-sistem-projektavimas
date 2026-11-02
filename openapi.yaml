@@ -1,0 +1,1365 @@
+openapi: 3.0.3
+info:
+  title: Team Collaboration Platform - REST API
+  version: "1.0"
+  description: |
+    REST API contract of the Team Collaboration Platform (team Vilkai). Base path `/api/v1`.
+
+    **General rules**
+    - IDs are integers (JSON numbers); a path ID that is not a positive integer returns 400 VALIDATION_ERROR.
+    - Timestamps are ISO 8601 UTC with milliseconds and a Z suffix; date-only values use `YYYY-MM-DD`. Empty values are sent as `null`, never omitted.
+    - `/api/v1` stays backwards compatible: fields, endpoints and enum values may be added, never removed or renamed (clients ignore unknown values).
+
+    **Access rule**: team missing or user not a member 404 TEAM_NOT_FOUND; channel missing or not viewable 404 CHANNEL_NOT_FOUND; message missing or not viewable 404 MESSAGE_NOT_FOUND; 403 FORBIDDEN only when the role does not allow the action.
+
+    **Errors**: every error has the body `Error`; clients check `code`, `message` is for developers, `details` only for VALIDATION_ERROR.
+
+    | Status | Meaning |
+    |---|---|
+    | 400 | Invalid request or field (VALIDATION_ERROR, INVALID_CURSOR) |
+    | 401 | Not authenticated (UNAUTHORIZED, TOKEN_EXPIRED); not repeated per endpoint |
+    | 403 | Role does not allow it, or email not verified |
+    | 404 | Missing or not visible to the user |
+    | 409 | Conflicts with the current state |
+    | 410 | Expired (invite, verification token) |
+    | 429 | Too many attempts; Retry-After header in seconds |
+    | 500 | INTERNAL_ERROR; not repeated per endpoint |
+
+    **Pagination**: `?limit=` (1-50; default 20, message history 30) and `?cursor=`. Response `{ items, prevCursor, nextCursor }` (older / newer; null = nothing more); one-direction lists return only `nextCursor`. Cursors are opaque. Not paginated: team members, team invites, my teams, mention suggestions, unread counts.
+
+    **Authentication**: `Authorization: Bearer <accessToken>` on every endpoint not marked public. Access token: JWT (HS256), 15 min, claims sub, iat, exp; roles are checked on every request. Refresh token: 30 days, rotated on every use; reusing a revoked one revokes all of the user's refresh tokens. On 401 TOKEN_EXPIRED the client calls /auth/refresh once and repeats the request.
+servers:
+  - url: https://api.example.com/api/v1
+    description: Example server (the host is not part of the specification)
+security:
+  - bearerAuth: []
+tags:
+  - name: Auth and users
+    description: Registration, email verification, login and tokens, the current user's profile and preferences, push devices.
+  - name: Teams, members and invites
+    description: Teams, members and roles, ownership transfer, invite codes and joining a team.
+  - name: Tasks
+    description: The team task board (create, edit, assign, take, status workflow) and the personal task calendar.
+  - name: Channels and messages
+    description: "Message history and sending messages. Incomplete: channel endpoints and the message fields are not described yet."
+  - name: Presence
+    description: Which team members are online right now.
+  - name: Replies, reactions, pins, notifications, search
+    description: Replies, emoji reactions, pinned messages, mention suggestions, notifications, unread counts and read position, message search.
+
+paths:
+  # ---------------------------------------------------------------- Auth and users (Pijus)
+  /auth/register:
+    post:
+      tags: [Auth and users]
+      summary: Register a new account
+      description: No token. A verification email is sent; no tokens are returned.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, tag, password]
+              properties:
+                email: { type: string, maxLength: 254 }
+                tag: { type: string, minLength: 3, maxLength: 32, description: "Characters a-z, 0-9, _ and . (no two periods in a row); stored in lowercase; unique" }
+                displayName: { type: string, minLength: 1, maxLength: 32 }
+                password: { type: string, minLength: 8, maxLength: 128 }
+      responses:
+        "201":
+          description: Account created, not verified yet
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user: { $ref: "#/components/schemas/RegisteredUser" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "409": { description: "EMAIL_TAKEN, TAG_TAKEN", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  /auth/verify-email:
+    post:
+      tags: [Auth and users]
+      summary: Confirm the email and log in
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/LoginResult" }
+        "400": { description: INVALID_VERIFICATION_TOKEN, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "410": { description: VERIFICATION_TOKEN_EXPIRED, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  /auth/resend-verification:
+    post:
+      tags: [Auth and users]
+      summary: Send a new verification email
+      description: Always 204, so it does not reveal whether the email is registered.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string }
+      responses:
+        "204": { description: Done }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+  /auth/login:
+    post:
+      tags: [Auth and users]
+      summary: Log in with email and password
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string }
+                password: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/LoginResult" }
+        "401": { description: INVALID_CREDENTIALS, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "403": { description: EMAIL_NOT_VERIFIED (only with the correct password), content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+  /auth/refresh:
+    post:
+      tags: [Auth and users]
+      summary: Get a new token pair
+      description: The refresh token is rotated; the old one stops working.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refreshToken]
+              properties:
+                refreshToken: { type: string }
+      responses:
+        "200":
+          description: New token pair
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuthTokens" }
+        "401": { description: INVALID_REFRESH_TOKEN, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  /auth/logout:
+    post:
+      tags: [Auth and users]
+      summary: Log out
+      description: Revokes the refresh token and deletes the device's push token.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refreshToken]
+              properties:
+                refreshToken: { type: string }
+                deviceId: { type: integer }
+      responses:
+        "204": { description: Logged out }
+  /users/tag-available:
+    get:
+      tags: [Auth and users]
+      summary: Check whether a tag is free
+      description: Used by the registration form while typing.
+      security: []
+      parameters:
+        - { name: tag, in: query, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: Result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  available: { type: boolean }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+  /users/me:
+    get:
+      tags: [Auth and users]
+      summary: Get the current user
+      responses:
+        "200":
+          description: Current user
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Me" }
+    patch:
+      tags: [Auth and users]
+      summary: Change tag or display name
+      description: Sends user.updated to all teams of the user.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                tag: { type: string, minLength: 3, maxLength: 32, description: "Characters a-z, 0-9, _ and . (no two periods in a row); stored in lowercase; unique" }
+                displayName: { type: string, minLength: 1, maxLength: 32 }
+      responses:
+        "200":
+          description: Same as GET /users/me
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Me" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "409": { description: TAG_TAKEN, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  /users/me/preferences:
+    patch:
+      tags: [Auth and users]
+      summary: Change date, time and time zone preferences
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                dateFormat: { $ref: "#/components/schemas/DateFormat" }
+                timeFormat: { $ref: "#/components/schemas/TimeFormat" }
+                timeZone: { type: string, nullable: true, maxLength: 64, description: "IANA zone, e.g. Europe/Vilnius; null = device time zone" }
+      responses:
+        "200":
+          description: Same as GET /users/me
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Me" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+  /users/me/tasks:
+    get:
+      tags: [Tasks]
+      summary: Tasks assigned to me with a due date in a range (Could have, personal calendar)
+      description: Tasks of all my teams, ordered by dueDate. The range may be at most 62 days.
+      parameters:
+        - { name: from, in: query, required: true, schema: { type: string, format: date } }
+        - { name: to, in: query, required: true, schema: { type: string, format: date } }
+      responses:
+        "200":
+          description: Tasks
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/Task" } }
+        "400": { $ref: "#/components/responses/ValidationError" }
+  /devices:
+    post:
+      tags: [Auth and users]
+      summary: Register a push token of a mobile device
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [platform, token]
+              properties:
+                platform: { type: string, enum: [ANDROID, IOS] }
+                token: { type: string, maxLength: 512 }
+      responses:
+        "201":
+          description: Device registered
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Device" }
+        "200":
+          description: Token was already registered; it is moved to the current user
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Device" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+  /devices/{deviceId}:
+    delete:
+      tags: [Auth and users]
+      summary: Delete a push token
+      parameters:
+        - { name: deviceId, in: path, required: true, schema: { type: integer } }
+      responses:
+        "204": { description: Deleted }
+        "404": { description: DEVICE_NOT_FOUND (other user's or missing), content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+
+  # ---------------------------------------------------------------- Teams, members and invites (Pijus)
+  /teams:
+    get:
+      tags: ["Teams, members and invites"]
+      summary: My teams (not paginated)
+      responses:
+        "200":
+          description: Teams
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/TeamListItem" } }
+    post:
+      tags: ["Teams, members and invites"]
+      summary: Create a team
+      description: "The creator becomes Owner; a #general public channel is created automatically."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, minLength: 1, maxLength: 64 }
+      responses:
+        "201":
+          description: Team created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CreatedTeam" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+  /teams/{teamId}:
+    parameters:
+      - $ref: "#/components/parameters/teamId"
+    get:
+      tags: ["Teams, members and invites"]
+      summary: Get a team
+      responses:
+        "200":
+          description: Team
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Team" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: ["Teams, members and invites"]
+      summary: Rename a team (Owner, Admin)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, minLength: 1, maxLength: 64 }
+      responses:
+        "200":
+          description: Team
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Team" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: ["Teams, members and invites"]
+      summary: Delete a team (Owner)
+      responses:
+        "204": { description: Deleted }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /teams/{teamId}/members:
+    parameters:
+      - $ref: "#/components/parameters/teamId"
+    get:
+      tags: ["Teams, members and invites"]
+      summary: Team members (not paginated)
+      description: Owner first, then Admins, then by displayName.
+      responses:
+        "200":
+          description: Members
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/Member" } }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /teams/{teamId}/presence:
+    parameters:
+      - $ref: "#/components/parameters/teamId"
+    get:
+      tags: [Presence]
+      summary: Current presence of the team (not paginated)
+      description: >-
+        Initial state load. The client calls it when it opens the team and after every
+        (re)connect, once the real-time connection is ready; later changes arrive as
+        presence.changed events. Lists only ONLINE members; every other member is OFFLINE.
+      responses:
+        "200":
+          description: Online members
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        userId: { type: integer }
+                        status: { type: string, enum: [ONLINE] }
+                        availability: { type: string, nullable: true }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /teams/{teamId}/members/{userId}:
+    parameters:
+      - $ref: "#/components/parameters/teamId"
+      - { name: userId, in: path, required: true, schema: { type: integer } }
+    patch:
+      tags: ["Teams, members and invites"]
+      summary: Promote or demote a member (Owner)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [role]
+              properties:
+                role: { type: string, enum: [ADMIN, MEMBER] }
+      responses:
+        "200":
+          description: Member
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Member" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { description: MEMBER_NOT_FOUND, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "409": { description: OWNER_CANNOT_LEAVE (target is Owner), content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+    delete:
+      tags: ["Teams, members and invites"]
+      summary: Remove a member (Owner)
+      responses:
+        "204": { description: Removed }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { description: MEMBER_NOT_FOUND, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "409": { description: OWNER_CANNOT_LEAVE, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  /teams/{teamId}/leave:
+    parameters:
+      - $ref: "#/components/parameters/teamId"
+    post:
+      tags: ["Teams, members and invites"]
+      summary: Leave the team (Admin, Member)
+      responses:
+        "204": { description: Left }
+        "409": { description: OWNER_CANNOT_LEAVE, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  /teams/{teamId}/transfer-ownership:
+    parameters:
+      - $ref: "#/components/parameters/teamId"
+    post:
+      tags: ["Teams, members and invites"]
+      summary: Transfer ownership to an Admin (Owner)
+      description: member.role_changed is sent for both users; a system message is posted.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [userId]
+              properties:
+                userId: { type: integer }
+      responses:
+        "200": { $ref: "#/components/responses/OwnershipResult" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { description: MEMBER_NOT_FOUND, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "409": { description: TARGET_NOT_ADMIN, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  /teams/{teamId}/claim-ownership:
+    parameters:
+      - $ref: "#/components/parameters/teamId"
+    post:
+      tags: ["Teams, members and invites"]
+      summary: Claim ownership when the Owner has been inactive for 30 days
+      description: Allowed for the longest-serving Admin (or Member, if there are no Admins). Same events as a transfer; the old Owner gets an email.
+      responses:
+        "200": { $ref: "#/components/responses/OwnershipResult" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { description: OWNER_ACTIVE, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  /teams/{teamId}/invites:
+    parameters:
+      - $ref: "#/components/parameters/teamId"
+    get:
+      tags: ["Teams, members and invites"]
+      summary: Active invites (Owner, Admin; not paginated)
+      description: Not expired and not revoked, newest first.
+      responses:
+        "200":
+          description: Invites
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/Invite" } }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    post:
+      tags: ["Teams, members and invites"]
+      summary: Create an invite (Owner, Admin)
+      description: |
+        Creates a multi-use invite valid for 7 days. Not idempotent: every call creates a new invite.
+        Earlier invites stay valid. No system message is posted and no WebSocket event is sent.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { type: object, description: Empty object; the lifetime is fixed by the system }
+      responses:
+        "201":
+          description: Invite created
+          headers:
+            Location: { schema: { type: string }, description: "/api/v1/teams/{teamId}/invites/{id}" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Invite" }
+              example:
+                id: 118
+                teamId: 42
+                code: K7Q2M9XA
+                createdBy: { id: 7, tag: pijus, displayName: Pijus }
+                createdAt: "2026-10-08T13:47:05.120Z"
+                expiresAt: "2026-10-15T13:47:05.120Z"
+                revokedAt: null
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /teams/{teamId}/invites/{inviteId}:
+    parameters:
+      - $ref: "#/components/parameters/teamId"
+      - { name: inviteId, in: path, required: true, schema: { type: integer } }
+    delete:
+      tags: ["Teams, members and invites"]
+      summary: Revoke an invite (Owner, Admin)
+      description: Sets revokedAt; the invite stops working at once.
+      responses:
+        "204": { description: Revoked }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { description: INVITE_NOT_FOUND, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  /invites/join:
+    post:
+      tags: ["Teams, members and invites"]
+      summary: Join a team with an invite code
+      description: The code is case-insensitive; spaces and hyphens are ignored. After 10 failed attempts within 10 minutes the user receives 429.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code: { type: string }
+      responses:
+        "200":
+          description: Joined as Member
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  team:
+                    type: object
+                    properties:
+                      id: { type: integer }
+                      name: { type: string }
+                      myRole: { $ref: "#/components/schemas/Role" }
+                      generalChannelId: { type: integer }
+        "404": { description: INVITE_NOT_FOUND, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "409": { description: ALREADY_MEMBER (body has teamId), content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "410": { description: INVITE_EXPIRED, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+
+  # ---------------------------------------------------------------- Tasks (Pijus)
+  /teams/{teamId}/tasks:
+    parameters:
+      - $ref: "#/components/parameters/teamId"
+    get:
+      tags: [Tasks]
+      summary: Tasks of a team (paginated, newest updatedAt first)
+      parameters:
+        - { name: status, in: query, required: false, schema: { $ref: "#/components/schemas/TaskStatus" } }
+        - { name: assigneeId, in: query, required: false, schema: { type: integer } }
+        - $ref: "#/components/parameters/limit"
+        - $ref: "#/components/parameters/cursor"
+      responses:
+        "200":
+          description: Tasks
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/Task" } }
+                  nextCursor: { type: string, nullable: true }
+        "400": { $ref: "#/components/responses/ValidationError" }
+    post:
+      tags: [Tasks]
+      summary: Create a task (Owner, Admin)
+      description: Sends task.created.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [title]
+              properties:
+                title: { type: string, minLength: 1, maxLength: 120 }
+                description: { type: string, maxLength: 2000 }
+                dueDate: { type: string, format: date }
+                assigneeId: { type: integer }
+      responses:
+        "201":
+          description: Task created
+          headers:
+            Location: { schema: { type: string }, description: "/api/v1/tasks/{taskId}" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Task" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { description: MEMBER_NOT_FOUND, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  /tasks/{taskId}:
+    parameters:
+      - $ref: "#/components/parameters/taskId"
+    get:
+      tags: [Tasks]
+      summary: Get a task
+      responses:
+        "200":
+          description: Task
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Task" }
+        "404": { description: TASK_NOT_FOUND, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+    patch:
+      tags: [Tasks]
+      summary: Edit a task (Owner, creator Admin)
+      description: Sends task.updated.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                title: { type: string, minLength: 1, maxLength: 120 }
+                description: { type: string, maxLength: 2000 }
+                dueDate: { type: string, format: date, nullable: true }
+      responses:
+        "200":
+          description: Task
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Task" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { description: INVALID_STATUS_TRANSITION (task is DONE), content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+    delete:
+      tags: [Tasks]
+      summary: Delete a task (Owner, creator Admin)
+      description: "Sends task.deleted { teamId, taskId }."
+      responses:
+        "204": { description: Deleted }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /tasks/{taskId}/assignee:
+    parameters:
+      - $ref: "#/components/parameters/taskId"
+    patch:
+      tags: [Tasks]
+      summary: Assign, reassign or unassign (Owner, Admin per the permissions matrix)
+      description: Sends task.updated (ASSIGNED) and a TASK_ASSIGNED notification.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [assigneeId]
+              properties:
+                assigneeId: { type: integer, nullable: true, description: null = unassign }
+      responses:
+        "200":
+          description: Task
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Task" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { description: MEMBER_NOT_FOUND, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "409": { description: INVALID_STATUS_TRANSITION (DONE), content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  /tasks/{taskId}/take:
+    parameters:
+      - $ref: "#/components/parameters/taskId"
+    post:
+      tags: [Tasks]
+      summary: Take an open task (any member)
+      description: Sends task.updated (ASSIGNED).
+      responses:
+        "200":
+          description: Task
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Task" }
+        "409": { description: "TASK_ALREADY_ASSIGNED, INVALID_STATUS_TRANSITION (not OPEN)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  /tasks/{taskId}/status:
+    parameters:
+      - $ref: "#/components/parameters/taskId"
+    post:
+      tags: [Tasks]
+      summary: Change the task status
+      description: Sends task.updated (STATUS_CHANGED), a TASK_STATUS_CHANGED notification and a system message.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: { $ref: "#/components/schemas/TaskStatus" }
+                comment: { type: string, minLength: 1, maxLength: 1000, description: Required when returning PENDING_REVIEW -> IN_PROGRESS }
+      responses:
+        "200":
+          description: Task
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Task" }
+        "400": { description: Comment missing when returning to IN_PROGRESS, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { description: INVALID_STATUS_TRANSITION (body has the current task), content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+
+  # ---------------------------------------------------------------- Channels and messages (Artūras) + replies (Rokas)
+  /channels/{channelId}/messages:
+    parameters:
+      - $ref: "#/components/parameters/channelId"
+    get:
+      tags: ["Channels and messages"]
+      summary: Message history; with `around`, the messages around one message
+      description: |
+        `around={messageId}` returns the target message with the messages before and after it (about half of `limit` on each side), oldest first. Cursors work as described in Pagination. A deleted target is returned as a deleted message.
+      parameters:
+        - { name: around, in: query, required: false, schema: { type: integer }, description: ID of the target message }
+        - { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 50, default: 30 } }
+        - $ref: "#/components/parameters/cursor"
+      responses:
+        "200":
+          description: Messages
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/Message" } }
+                  prevCursor: { type: string, nullable: true }
+                  nextCursor: { type: string, nullable: true }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "404": { description: "MESSAGE_NOT_FOUND (target not in this channel), CHANNEL_NOT_FOUND", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+    post:
+      tags: ["Channels and messages"]
+      summary: Send a message; with parentId, a reply
+      description: |
+        An optional `parentId` makes the message a reply to a message in the same channel; it cannot be changed later.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                clientMessageId: { type: string, minLength: 1, maxLength: 64, description: Idempotency key generated by the client for every new message }
+                parentId: { type: integer, nullable: true, description: Message being replied to }
+      responses:
+        "201":
+          description: "TODO (Artūras): as in REST - Channels and messages"
+        "404": { description: "MESSAGE_NOT_FOUND (parent not in channel)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "409": { description: PARENT_MESSAGE_DELETED, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+
+  # ---------------------------------------------------------------- Replies, reactions, pins, notifications, search (Rokas)
+  /messages/{messageId}/reactions:
+    parameters:
+      - $ref: "#/components/parameters/messageId"
+    post:
+      tags: ["Replies, reactions, pins, notifications, search"]
+      summary: Add my reaction
+      description: The client calls POST when reactedByMe is false and DELETE when it is true; the server never toggles. Max 20 different emoji per message (REACTION_LIMIT_REACHED). Sends reaction.added.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [emoji]
+              properties:
+                emoji: { type: string, maxLength: 32, description: "One emoji (one grapheme cluster), normalised to NFC with U+FE0F added where needed" }
+      responses:
+        "201":
+          description: Reaction added
+          headers:
+            Location: { schema: { type: string }, description: "/api/v1/messages/{messageId}/reactions/{emoji}" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReactionsResult" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "MESSAGE_DELETED, ALREADY_REACTED (client re-reads the summary), REACTION_LIMIT_REACHED", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  /messages/{messageId}/reactions/{emoji}:
+    parameters:
+      - $ref: "#/components/parameters/messageId"
+      - $ref: "#/components/parameters/emoji"
+    delete:
+      tags: ["Replies, reactions, pins, notifications, search"]
+      summary: Remove my reaction
+      description: Sends reaction.removed.
+      responses:
+        "200":
+          description: Reaction removed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReactionsResult" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "404": { description: "REACTION_NOT_FOUND, MESSAGE_NOT_FOUND", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "409": { description: MESSAGE_DELETED, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  /messages/{messageId}/reactions/{emoji}/users:
+    parameters:
+      - $ref: "#/components/parameters/messageId"
+      - $ref: "#/components/parameters/emoji"
+    get:
+      tags: ["Replies, reactions, pins, notifications, search"]
+      summary: Who reacted with this emoji
+      parameters:
+        - $ref: "#/components/parameters/limit"
+        - $ref: "#/components/parameters/cursor"
+      responses:
+        "200":
+          description: Users
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/UserRef" } }
+                  nextCursor: { type: string, nullable: true }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /channels/{channelId}/pins:
+    parameters:
+      - $ref: "#/components/parameters/channelId"
+    get:
+      tags: ["Replies, reactions, pins, notifications, search"]
+      summary: Pinned messages of a channel
+      description: Newest pin first (pinnedAt, then id descending).
+      parameters:
+        - $ref: "#/components/parameters/limit"
+        - $ref: "#/components/parameters/cursor"
+      responses:
+        "200":
+          description: Pins
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/PinListItem" } }
+                  nextCursor: { type: string, nullable: true }
+                  pinnedCount: { type: integer }
+        "404": { $ref: "#/components/responses/NotFound" }
+    post:
+      tags: ["Replies, reactions, pins, notifications, search"]
+      summary: Pin a message (Owner, Admin)
+      description: Sets isPinned, pinnedById and pinnedAt of the message; sends message.pinned. Max 50 pins per channel.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [messageId]
+              properties:
+                messageId: { type: integer }
+      responses:
+        "201":
+          description: Pinned
+          headers:
+            Location: { schema: { type: string }, description: "/api/v1/channels/{channelId}/pins/{messageId}" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Pin" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { description: MESSAGE_NOT_FOUND, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "409": { description: "MESSAGE_DELETED, ALREADY_PINNED (client refreshes the list), PIN_LIMIT_REACHED", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  /channels/{channelId}/pins/{messageId}:
+    parameters:
+      - $ref: "#/components/parameters/channelId"
+      - $ref: "#/components/parameters/messageId"
+    delete:
+      tags: ["Replies, reactions, pins, notifications, search"]
+      summary: Unpin a message (Owner, Admin)
+      description: Clears isPinned, pinnedById and pinnedAt; sends message.unpinned.
+      responses:
+        "204": { description: Unpinned }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { description: PIN_NOT_FOUND, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  /channels/{channelId}/mention-suggestions:
+    parameters:
+      - $ref: "#/components/parameters/channelId"
+    get:
+      tags: ["Replies, reactions, pins, notifications, search"]
+      summary: Mention suggestions (not paginated)
+      description: Members who can view the channel and whose tag starts with q, shown with their displayName; max 8. The client asks only after at least 3 characters are typed.
+      parameters:
+        - { name: q, in: query, required: true, schema: { type: string, minLength: 3, maxLength: 32 } }
+      responses:
+        "200":
+          description: Suggestions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, maxItems: 8, items: { $ref: "#/components/schemas/UserRef" } }
+                  canMentionChannel: { type: boolean, description: true for Owner / Admin }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /teams/{teamId}/notifications:
+    parameters:
+      - $ref: "#/components/parameters/teamId"
+    get:
+      tags: ["Replies, reactions, pins, notifications, search"]
+      summary: My notifications in a team (newest first)
+      parameters:
+        - { name: unreadOnly, in: query, required: false, schema: { type: boolean, default: false } }
+        - $ref: "#/components/parameters/limit"
+        - $ref: "#/components/parameters/cursor"
+      responses:
+        "200":
+          description: Notifications
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/NotificationItem" } }
+                  nextCursor: { type: string, nullable: true }
+                  unreadCount: { type: integer }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /notifications/{notificationId}:
+    parameters:
+      - { name: notificationId, in: path, required: true, schema: { type: integer } }
+    patch:
+      tags: ["Replies, reactions, pins, notifications, search"]
+      summary: Mark a notification as read
+      description: Already read returns the same readAt and sends no event; otherwise sends notification.read.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [isRead]
+              properties:
+                isRead: { type: boolean, enum: [true] }
+      responses:
+        "200":
+          description: Read
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: integer }
+                  isRead: { type: boolean }
+                  readAt: { type: string, format: date-time }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "404": { description: NOTIFICATION_NOT_FOUND (other user's or hidden), content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  /teams/{teamId}/notifications/read-all:
+    parameters:
+      - $ref: "#/components/parameters/teamId"
+    post:
+      tags: ["Replies, reactions, pins, notifications, search"]
+      summary: Mark all my notifications of the team as read
+      responses:
+        "200":
+          description: Done
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  updatedCount: { type: integer }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /teams/{teamId}/unread:
+    parameters:
+      - $ref: "#/components/parameters/teamId"
+    get:
+      tags: ["Replies, reactions, pins, notifications, search"]
+      summary: Unread counts of all channels I can view (not paginated)
+      responses:
+        "200":
+          description: Unread counts
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  channels: { type: array, items: { $ref: "#/components/schemas/UnreadChannel" } }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /channels/{channelId}/read-state:
+    parameters:
+      - $ref: "#/components/parameters/channelId"
+    patch:
+      tags: ["Replies, reactions, pins, notifications, search"]
+      summary: Move my read position
+      description: The position never moves backwards (an older message leaves it unchanged); a deleted message is accepted. Sends readstate.updated when the position moved.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [lastReadMessageId]
+              properties:
+                lastReadMessageId: { type: integer }
+      responses:
+        "200":
+          description: Read state
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  channelId: { type: integer }
+                  lastReadMessageId: { type: integer, nullable: true }
+                  lastReadAt: { type: string, format: date-time }
+                  unreadCount: { type: integer }
+        "404": { description: "MESSAGE_NOT_FOUND (not in channel), CHANNEL_NOT_FOUND", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  /teams/{teamId}/messages/search:
+    parameters:
+      - $ref: "#/components/parameters/teamId"
+    get:
+      tags: ["Replies, reactions, pins, notifications, search"]
+      summary: Search messages (Could have)
+      description: Case-insensitive substring (% and _ literal); only channels the user can view; no deleted or system messages; newest first. highlights are in UTF-16 code units.
+      parameters:
+        - { name: q, in: query, required: true, schema: { type: string, minLength: 2, maxLength: 100 } }
+        - { name: channelId, in: query, required: false, schema: { type: integer } }
+        - $ref: "#/components/parameters/limit"
+        - $ref: "#/components/parameters/cursor"
+      responses:
+        "200":
+          description: Results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/SearchResult" } }
+                  nextCursor: { type: string, nullable: true }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  parameters:
+    teamId: { name: teamId, in: path, required: true, schema: { type: integer, minimum: 1 } }
+    channelId: { name: channelId, in: path, required: true, schema: { type: integer, minimum: 1 } }
+    messageId: { name: messageId, in: path, required: true, schema: { type: integer, minimum: 1 } }
+    taskId: { name: taskId, in: path, required: true, schema: { type: integer, minimum: 1 } }
+    emoji: { name: emoji, in: path, required: true, schema: { type: string }, description: URL-encoded emoji }
+    limit: { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 50, default: 20 } }
+    cursor: { name: cursor, in: query, required: false, schema: { type: string }, description: Opaque cursor from the previous response }
+  responses:
+    ValidationError:
+      description: "VALIDATION_ERROR (with details), INVALID_CURSOR"
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    Forbidden:
+      description: FORBIDDEN (the role does not allow the action)
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    NotFound:
+      description: "TEAM_NOT_FOUND, CHANNEL_NOT_FOUND or MESSAGE_NOT_FOUND (missing or not visible to the user)"
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    TooManyRequests:
+      description: TOO_MANY_REQUESTS
+      headers:
+        Retry-After: { schema: { type: integer }, description: Seconds }
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    LoginResult:
+      description: Logged in
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: "#/components/schemas/AuthTokens"
+              - type: object
+                properties:
+                  user: { $ref: "#/components/schemas/Me" }
+    OwnershipResult:
+      description: New owner
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              teamId: { type: integer }
+              ownerId: { type: integer }
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string, example: VALIDATION_ERROR }
+            message: { type: string, example: Request is not valid. }
+            details:
+              type: array
+              items:
+                type: object
+                properties:
+                  field: { type: string, example: title }
+                  issue: { type: string, example: Must be 1-120 characters. }
+    UserRef:
+      type: object
+      description: A user embedded in another object.
+      required: [id, tag, displayName]
+      properties:
+        id: { type: integer, example: 7 }
+        tag: { type: string, example: pijus }
+        displayName: { type: string, example: Pijus }
+    Role: { type: string, enum: [OWNER, ADMIN, MEMBER] }
+    DateFormat: { type: string, enum: [AUTO, DMY, MDY, YMD] }
+    TimeFormat: { type: string, enum: [AUTO, H24, H12] }
+    TaskStatus: { type: string, enum: [OPEN, IN_PROGRESS, PENDING_REVIEW, DONE] }
+    RegisteredUser:
+      example: {"id": 9, "email": "rokas@example.com", "tag": "rokas", "displayName": "Rokas", "emailVerified": false}
+      type: object
+      properties:
+        id: { type: integer }
+        email: { type: string }
+        tag: { type: string }
+        displayName: { type: string }
+        emailVerified: { type: boolean, example: false }
+    Me:
+      example: {"id": 9, "email": "rokas@example.com", "tag": "rokas", "displayName": "Rokas", "dateFormat": "AUTO", "timeFormat": "H24", "timeZone": "Europe/Vilnius", "createdAt": "2026-10-01T08:00:00.000Z"}
+      type: object
+      properties:
+        id: { type: integer }
+        email: { type: string }
+        tag: { type: string }
+        displayName: { type: string }
+        dateFormat: { $ref: "#/components/schemas/DateFormat" }
+        timeFormat: { $ref: "#/components/schemas/TimeFormat" }
+        timeZone: { type: string, nullable: true }
+        createdAt: { type: string, format: date-time }
+    AuthTokens:
+      example: {"accessToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...", "refreshToken": "q8X2...", "accessTokenExpiresAt": "2026-10-08T14:02:05.120Z"}
+      type: object
+      properties:
+        accessToken: { type: string }
+        refreshToken: { type: string }
+        accessTokenExpiresAt: { type: string, format: date-time }
+    Device:
+      example: {"id": 5, "platform": "ANDROID", "createdAt": "2026-10-08T13:47:05.120Z"}
+      type: object
+      properties:
+        id: { type: integer }
+        platform: { type: string, enum: [ANDROID, IOS] }
+        createdAt: { type: string, format: date-time }
+    TeamListItem:
+      example: {"id": 42, "name": "Vilkai", "myRole": "ADMIN", "memberCount": 4}
+      type: object
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        myRole: { $ref: "#/components/schemas/Role" }
+        memberCount: { type: integer }
+    Team:
+      example: {"id": 42, "name": "Vilkai", "myRole": "ADMIN", "createdAt": "2026-09-11T10:00:00.000Z"}
+      type: object
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        myRole: { $ref: "#/components/schemas/Role" }
+        createdAt: { type: string, format: date-time }
+    CreatedTeam:
+      example: {"id": 42, "name": "Vilkai", "myRole": "OWNER", "generalChannelId": 12, "createdAt": "2026-09-11T10:00:00.000Z"}
+      type: object
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        myRole: { $ref: "#/components/schemas/Role" }
+        generalChannelId: { type: integer }
+        createdAt: { type: string, format: date-time }
+    Member:
+      example: {"id": 9, "tag": "rokas", "displayName": "Rokas", "role": "MEMBER", "joinedAt": "2026-09-12T09:30:00.000Z"}
+      type: object
+      properties:
+        id: { type: integer }
+        tag: { type: string }
+        displayName: { type: string }
+        role: { $ref: "#/components/schemas/Role" }
+        status: { type: string, description: "Availability / presence status. TODO (Artūras): values are defined in Presence and typing indicators." }
+        joinedAt: { type: string, format: date-time }
+    Invite:
+      example: {"id": 118, "teamId": 42, "code": "K7Q2M9XA", "createdBy": {"id": 7, "tag": "pijus", "displayName": "Pijus"}, "createdAt": "2026-10-08T13:47:05.120Z", "expiresAt": "2026-10-15T13:47:05.120Z", "revokedAt": null}
+      type: object
+      properties:
+        id: { type: integer, description: "Invite ID (used to revoke it)" }
+        teamId: { type: integer }
+        code: { type: string, minLength: 8, maxLength: 8, description: "Uppercase letters and digits without look-alike characters (0, O, 1, I, L); unique" }
+        createdBy: { allOf: [{ $ref: "#/components/schemas/UserRef" }], nullable: true }
+        createdAt: { type: string, format: date-time }
+        expiresAt: { type: string, format: date-time, description: createdAt + 7 days }
+        revokedAt: { type: string, format: date-time, nullable: true }
+    Task:
+      example: {"id": 77, "teamId": 42, "title": "Write data model section", "description": "", "status": "PENDING_REVIEW", "createdBy": {"id": 7, "tag": "pijus", "displayName": "Pijus"}, "assignee": {"id": 9, "tag": "rokas", "displayName": "Rokas"}, "dueDate": "2026-10-22", "reviewComment": null, "createdAt": "2026-10-08T13:47:05.120Z", "updatedAt": "2026-10-08T15:10:00.000Z", "completedAt": null}
+      type: object
+      description: Used in every response and in task.created / task.updated events.
+      properties:
+        id: { type: integer, example: 77 }
+        teamId: { type: integer, example: 42 }
+        title: { type: string, example: Write data model section }
+        description: { type: string, example: "" }
+        status: { $ref: "#/components/schemas/TaskStatus" }
+        createdBy: { allOf: [{ $ref: "#/components/schemas/UserRef" }], nullable: true, description: null when not set or the user left the team }
+        assignee: { allOf: [{ $ref: "#/components/schemas/UserRef" }], nullable: true, description: null when not set or the user left the team }
+        dueDate: { type: string, format: date, nullable: true, example: "2026-10-22" }
+        reviewComment: { type: string, nullable: true }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+        completedAt: { type: string, format: date-time, nullable: true }
+    MessageBase:
+      type: object
+      description: "TODO (Artūras): the fields of a message (id, channelId, author, content, type, editCount, editedAt, deletedAt, createdAt...) are defined in REST - Channels and messages."
+    MessageAdditions:
+      type: object
+      description: Fields that every full message object also has (history, message.created / updated / deleted events).
+      properties:
+        parentId: { type: integer, nullable: true, example: 901 }
+        parent:
+          type: object
+          nullable: true
+          description: null if not a reply
+          properties:
+            id: { type: integer, example: 901 }
+            author: { allOf: [{ $ref: "#/components/schemas/UserRef" }], nullable: true, description: null for SYSTEM messages }
+            preview: { type: string, nullable: true, description: null when isDeleted, example: "Please finish your sections..." }
+            isDeleted: { type: boolean, example: false }
+        reactions:
+          type: array
+          description: Ordered by first use; empty for deleted messages.
+          items: { $ref: "#/components/schemas/ReactionSummary" }
+        isPinned: { type: boolean }
+        mentions:
+          type: array
+          items:
+            type: object
+            properties:
+              type: { type: string, enum: [USER, CHANNEL] }
+              userId: { type: integer, nullable: true, description: null for CHANNEL }
+              tag: { type: string, nullable: true, description: null for CHANNEL }
+              displayName: { type: string, nullable: true, description: null for CHANNEL }
+    Message:
+      allOf:
+        - $ref: "#/components/schemas/MessageBase"
+        - $ref: "#/components/schemas/MessageAdditions"
+    ReactionSummary:
+      type: object
+      properties:
+        emoji: { type: string, example: "👍" }
+        count: { type: integer, example: 3 }
+        reactedByMe: { type: boolean, example: true }
+    ReactionsResult:
+      example: {"messageId": 901, "reactions": [{"emoji": "👍", "count": 3, "reactedByMe": true}]}
+      type: object
+      properties:
+        messageId: { type: integer }
+        reactions: { type: array, items: { $ref: "#/components/schemas/ReactionSummary" } }
+    PinnedMessageSummary:
+      example: {"id": 901, "author": {"id": 7, "tag": "pijus", "displayName": "Pijus"}, "preview": "Please finish your sections...", "createdAt": "2026-10-08T13:47:05.120Z"}
+      type: object
+      properties:
+        id: { type: integer }
+        author: { allOf: [{ $ref: "#/components/schemas/UserRef" }], nullable: true, description: null for SYSTEM messages }
+        preview: { type: string, description: "Text with line breaks replaced by spaces, max 100 characters without splitting an emoji" }
+        createdAt: { type: string, format: date-time }
+    Pin:
+      example: {"messageId": 901, "channelId": 12, "pinnedBy": {"id": 7, "tag": "pijus", "displayName": "Pijus"}, "pinnedAt": "2026-10-08T14:00:00.000Z"}
+      type: object
+      properties:
+        messageId: { type: integer }
+        channelId: { type: integer }
+        pinnedBy: { $ref: "#/components/schemas/UserRef" }
+        pinnedAt: { type: string, format: date-time }
+    PinListItem:
+      example: {"message": {"id": 901, "author": {"id": 7, "tag": "pijus", "displayName": "Pijus"}, "preview": "Please finish your sections...", "createdAt": "2026-10-08T13:47:05.120Z"}, "pinnedBy": {"id": 7, "tag": "pijus", "displayName": "Pijus"}, "pinnedAt": "2026-10-08T14:00:00.000Z"}
+      type: object
+      properties:
+        message: { $ref: "#/components/schemas/PinnedMessageSummary" }
+        pinnedBy: { $ref: "#/components/schemas/UserRef" }
+        pinnedAt: { type: string, format: date-time }
+    NotificationType: { type: string, enum: [MENTION, CHANNEL_MENTION, REPLY, TASK_ASSIGNED, TASK_STATUS_CHANGED] }
+    NotificationItem:
+      example: {"id": 3001, "type": "TASK_STATUS_CHANGED", "actor": {"id": 7, "tag": "pijus", "displayName": "Pijus"}, "channelId": null, "messageId": null, "taskId": 77, "taskStatus": "PENDING_REVIEW", "preview": "Write data model section", "isRead": false, "createdAt": "2026-10-08T15:10:00.000Z"}
+      type: object
+      properties:
+        id: { type: integer, example: 3001 }
+        type: { $ref: "#/components/schemas/NotificationType" }
+        actor: { allOf: [{ $ref: "#/components/schemas/UserRef" }], nullable: true, description: null if caused by the system }
+        channelId: { type: integer, nullable: true }
+        messageId: { type: integer, nullable: true }
+        taskId: { type: integer, nullable: true, example: 77 }
+        taskStatus: { allOf: [{ $ref: "#/components/schemas/TaskStatus" }], nullable: true }
+        preview: { type: string, nullable: true, description: "Message types: the preview text; task types: the task title", example: Write data model section }
+        isRead: { type: boolean, example: false }
+        createdAt: { type: string, format: date-time }
+    UnreadChannel:
+      example: {"channelId": 12, "unreadCount": 5, "lastReadMessageId": 890, "lastReadAt": "2026-10-08T12:00:00.000Z", "firstUnreadMessageId": 895}
+      type: object
+      properties:
+        channelId: { type: integer }
+        unreadCount: { type: integer }
+        lastReadMessageId: { type: integer, nullable: true }
+        lastReadAt: { type: string, format: date-time }
+        firstUnreadMessageId: { type: integer, nullable: true }
+    SearchResult:
+      example: {"messageId": 901, "channel": {"id": 12, "name": "general", "isPrivate": false}, "author": {"id": 7, "tag": "pijus", "displayName": "Pijus"}, "content": "Please finish your sections by Friday", "highlights": [{"start": 7, "length": 6}], "createdAt": "2026-10-08T13:47:05.120Z"}
+      type: object
+      properties:
+        messageId: { type: integer }
+        channel:
+          type: object
+          properties:
+            id: { type: integer }
+            name: { type: string }
+            isPrivate: { type: boolean }
+        author: { allOf: [{ $ref: "#/components/schemas/UserRef" }], nullable: true }
+        content: { type: string }
+        highlights:
+          type: array
+          items:
+            type: object
+            properties:
+              start: { type: integer }
+              length: { type: integer }
+        createdAt: { type: string, format: date-time }
