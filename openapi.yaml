@@ -881,7 +881,7 @@ paths:
     post:
       tags: ["Replies, reactions, pins, notifications, search"]
       summary: Pin a message (Owner, Admin)
-      description: Sets isPinned, pinnedById and pinnedAt of the message; sends message.pinned. Max 50 pins per channel.
+      description: Sets pinnedById and pinnedAt of the message (isPinned in the API = pinnedAt is not null); sends message.pinned. Max 50 pins per channel.
       requestBody:
         required: true
         content:
@@ -909,7 +909,7 @@ paths:
     delete:
       tags: ["Replies, reactions, pins, notifications, search"]
       summary: Unpin a message (Owner, Admin)
-      description: Clears isPinned, pinnedById and pinnedAt; sends message.unpinned.
+      description: Clears pinnedById and pinnedAt; sends message.unpinned.
       responses:
         "204": { description: Unpinned }
         "403": { $ref: "#/components/responses/Forbidden" }
@@ -1279,6 +1279,14 @@ components:
               userId: { type: integer, nullable: true, description: null for CHANNEL }
               tag: { type: string, nullable: true, description: null for CHANNEL }
               displayName: { type: string, nullable: true, description: null for CHANNEL }
+              ranges:
+                type: array
+                description: Where the mention is in content, in UTF-16 code units; one item per occurrence. The client highlights these ranges and shows the user's current @tag there instead of searching the text.
+                items:
+                  type: object
+                  properties:
+                    start: { type: integer, example: 0 }
+                    length: { type: integer, example: 6 }
     Message:
       allOf:
         - $ref: "#/components/schemas/MessageBase"
