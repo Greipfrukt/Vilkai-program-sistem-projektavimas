@@ -27,7 +27,7 @@ info:
 
     **Pagination**: `?limit=` (1-50; default 20, message history 30) and `?cursor=`. Response `{ items, prevCursor, nextCursor }` (older / newer; null = nothing more); one-direction lists return only `nextCursor`. Cursors are opaque. Not paginated: team members, team invites, my teams, mention suggestions, unread counts.
 
-    **Authentication**: `Authorization: Bearer <accessToken>` on every endpoint not marked public. Access token: JWT (HS256), 15 min, claims sub, iat, exp; roles are checked on every request. Refresh token: 30 days, rotated on every use; reusing a revoked one revokes all of the user's refresh tokens. On 401 TOKEN_EXPIRED the client calls /auth/refresh once and repeats the request.
+    **Authentication**: `Authorization: Bearer <accessToken>` on every endpoint not marked public. Access token: JWT (HS256), 15 min, claims sub, tag, iat, exp; roles are not in the token, the server reads the current role on every request. Refresh token: 30 days, rotated on every use; reusing a revoked one revokes all of the user's refresh tokens. On 401 TOKEN_EXPIRED the client calls /auth/refresh once and repeats the request.
 servers:
   - url: https://api.example.com/api/v1
     description: Example server (the host is not part of the specification)
@@ -41,7 +41,7 @@ tags:
   - name: Tasks
     description: The team task board (create, edit, assign, take, status workflow) and the personal task calendar.
   - name: Channels and messages
-    description: "Message history and sending messages. Incomplete: channel endpoints and the message fields are not described yet."
+    description: "Public and private channels, channel members, message history, sending, editing and deleting messages."
   - name: Presence
     description: Which team members are online right now.
   - name: Replies, reactions, pins, notifications, search
@@ -64,7 +64,7 @@ paths:
               required: [email, tag, password]
               properties:
                 email: { type: string, maxLength: 254 }
-                tag: { type: string, minLength: 3, maxLength: 32, description: "Characters a-z, 0-9, _ and . (no two periods in a row); stored in lowercase; unique" }
+                tag: { type: string, minLength: 3, maxLength: 32, description: "Characters a-z, 0-9, _ and . (cannot start or end with a period, no two periods in a row); stored in lowercase; unique" }
                 displayName: { type: string, minLength: 1, maxLength: 32 }
                 password: { type: string, minLength: 8, maxLength: 128 }
       responses:
@@ -204,8 +204,8 @@ paths:
               schema: { $ref: "#/components/schemas/Me" }
     patch:
       tags: [Auth and users]
-      summary: Change tag or display name
-      description: Sends user.updated to all teams of the user.
+      summary: Change display name or availability
+      description: "A display name change sends user.updated { user { id, tag, displayName } } to the team group of every team of the user; an availability change sends presence.changed. The tag cannot be changed."
       requestBody:
         required: true
         content:
@@ -213,8 +213,8 @@ paths:
             schema:
               type: object
               properties:
-                tag: { type: string, minLength: 3, maxLength: 32, description: "Characters a-z, 0-9, _ and . (no two periods in a row); stored in lowercase; unique" }
                 displayName: { type: string, minLength: 1, maxLength: 32 }
+                availability: { $ref: "#/components/schemas/Availability" }
       responses:
         "200":
           description: Same as GET /users/me
@@ -222,7 +222,6 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Me" }
         "400": { $ref: "#/components/responses/ValidationError" }
-        "409": { description: TAG_TAKEN, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
   /users/me/preferences:
     patch:
       tags: [Auth and users]
@@ -412,10 +411,13 @@ paths:
                     type: array
                     items:
                       type: object
+                      description: A user as in the member list plus status and availability; the client matches it with the member list by id.
                       properties:
-                        userId: { type: integer }
+                        id: { type: integer }
+                        tag: { type: string }
+                        displayName: { type: string }
                         status: { type: string, enum: [ONLINE] }
-                        availability: { type: string, nullable: true }
+                        availability: { $ref: "#/components/schemas/Availability" }
         "404": { $ref: "#/components/responses/NotFound" }
   /teams/{teamId}/members/{userId}:
     parameters:
@@ -670,7 +672,7 @@ paths:
               schema: { $ref: "#/components/schemas/Task" }
         "400": { $ref: "#/components/responses/ValidationError" }
         "403": { $ref: "#/components/responses/Forbidden" }
-        "409": { description: INVALID_STATUS_TRANSITION (task is DONE), content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "409": { description: TASK_ALREADY_DONE (task is DONE), content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
     delete:
       tags: [Tasks]
       summary: Delete a task (Owner, creator Admin)
@@ -702,7 +704,7 @@ paths:
               schema: { $ref: "#/components/schemas/Task" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { description: MEMBER_NOT_FOUND, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
-        "409": { description: INVALID_STATUS_TRANSITION (DONE), content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "409": { description: TASK_ALREADY_DONE (task is DONE), content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
   /tasks/{taskId}/take:
     parameters:
       - $ref: "#/components/parameters/taskId"
@@ -745,6 +747,169 @@ paths:
         "409": { description: INVALID_STATUS_TRANSITION (body has the current task), content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
 
   # ---------------------------------------------------------------- Channels and messages (Artūras) + replies (Rokas)
+  /teams/{teamId}/channels:
+    parameters:
+      - $ref: "#/components/parameters/teamId"
+    get:
+      tags: ["Channels and messages"]
+      summary: Channels I can view (not paginated)
+      description: "All public channels and the private channels the user belongs to; #general first, then by name ignoring case. With includePrivate=true (Owner, Admin only) also the other private channels of the team, each with isMember false, so they can be renamed, deleted or managed (this gives no access to their messages)."
+      parameters:
+        - { name: includePrivate, in: query, required: false, schema: { type: boolean, default: false } }
+      responses:
+        "200":
+          description: Channels
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/Channel" } }
+        "403": { description: FORBIDDEN (includePrivate=true by a Member), content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+    post:
+      tags: ["Channels and messages"]
+      summary: Create a channel (Owner, Admin)
+      description: "type cannot be changed later. memberIds (team members, private channels only) are added together with the creator, who is the first member of a private channel."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, type]
+              properties:
+                name: { type: string, minLength: 1, maxLength: 50, description: "1-50 characters after trimming, unique in the team ignoring case" }
+                type: { $ref: "#/components/schemas/ChannelType" }
+                memberIds: { type: array, items: { type: integer }, description: Private channels only }
+      responses:
+        "201":
+          description: Channel created
+          headers:
+            Location: { schema: { type: string }, description: "/api/v1/channels/{channelId}" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Channel" }
+        "400": { description: "VALIDATION_ERROR (also memberIds when type = PUBLIC, or a user who is not in the team)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: CHANNEL_NAME_TAKEN, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  /channels/{channelId}:
+    parameters:
+      - $ref: "#/components/parameters/channelId"
+    get:
+      tags: ["Channels and messages"]
+      summary: Get a channel
+      responses:
+        "200":
+          description: Channel
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Channel" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: ["Channels and messages"]
+      summary: "Rename a channel (Owner, Admin; not #general)"
+      description: An Owner or Admin may rename any private channel of the team without being a member of it.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, minLength: 1, maxLength: 50 }
+      responses:
+        "200":
+          description: Channel
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Channel" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "CHANNEL_NAME_TAKEN, CHANNEL_PROTECTED (#general)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+    delete:
+      tags: ["Channels and messages"]
+      summary: "Delete a channel (Owner, Admin; not #general)"
+      description: Deletes the channel with its messages, pins, reactions, notifications, mentions and read states.
+      responses:
+        "204": { description: Deleted }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "CHANNEL_PROTECTED (#general)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  /channels/{channelId}/members:
+    parameters:
+      - $ref: "#/components/parameters/channelId"
+    get:
+      tags: ["Channels and messages"]
+      summary: Members of a private channel
+      parameters:
+        - $ref: "#/components/parameters/limit"
+        - $ref: "#/components/parameters/cursor"
+      responses:
+        "200":
+          description: Members
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/UserRef" } }
+                  nextCursor: { type: string, nullable: true }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: CHANNEL_NOT_PRIVATE, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+    post:
+      tags: ["Channels and messages"]
+      summary: Add a member to a private channel (Owner, Admin)
+      description: Creates the member's read state and starts live updates of the channel for them.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [userId]
+              properties:
+                userId: { type: integer }
+      responses:
+        "201":
+          description: Member added
+          headers:
+            Location: { schema: { type: string }, description: "/api/v1/channels/{channelId}/members/{userId}" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UserRef" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { description: "MEMBER_NOT_FOUND (user is not on the team), TEAM_NOT_FOUND, CHANNEL_NOT_FOUND", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "409": { description: "CHANNEL_NOT_PRIVATE, ALREADY_CHANNEL_MEMBER", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  /channels/{channelId}/members/{userId}:
+    parameters:
+      - $ref: "#/components/parameters/channelId"
+      - { name: userId, in: path, required: true, schema: { type: integer, minimum: 1 } }
+    delete:
+      tags: ["Channels and messages"]
+      summary: Remove a member from a private channel (Owner, Admin)
+      description: Deletes the member's read state, stops live updates and hides that channel's notifications for them.
+      responses:
+        "204": { description: Removed }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { description: "MEMBER_NOT_FOUND (not a member of this channel), TEAM_NOT_FOUND, CHANNEL_NOT_FOUND", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "409": { description: CHANNEL_NOT_PRIVATE, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  /channels/{channelId}/leave:
+    parameters:
+      - $ref: "#/components/parameters/channelId"
+    post:
+      tags: ["Channels and messages"]
+      summary: Leave a private channel (any member of it)
+      description: Same cleanup as removal; channel.left is sent to user-{userId}.
+      responses:
+        "204": { description: Left }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: CHANNEL_NOT_PRIVATE, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
   /channels/{channelId}/messages:
     parameters:
       - $ref: "#/components/parameters/channelId"
@@ -752,7 +917,9 @@ paths:
       tags: ["Channels and messages"]
       summary: Message history; with `around`, the messages around one message
       description: |
-        `around={messageId}` returns the target message with the messages before and after it (about half of `limit` on each side), oldest first. Cursors work as described in Pagination. A deleted target is returned as a deleted message.
+        Without a cursor the newest `limit` messages are returned, oldest first. `prevCursor` loads older messages and `nextCursor` newer ones (each is null at its end). Deleted and system messages are included.
+
+        `around={messageId}` returns floor((limit - 1) / 2) messages before the target, the target and the rest after it (the other side fills up if one side is short), oldest first. A deleted target is returned as a deleted message.
       parameters:
         - { name: around, in: query, required: false, schema: { type: integer }, description: ID of the target message }
         - { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 50, default: 30 } }
@@ -768,27 +935,91 @@ paths:
                   items: { type: array, items: { $ref: "#/components/schemas/Message" } }
                   prevCursor: { type: string, nullable: true }
                   nextCursor: { type: string, nullable: true }
-        "400": { $ref: "#/components/responses/ValidationError" }
-        "404": { description: "MESSAGE_NOT_FOUND (target not in this channel), CHANNEL_NOT_FOUND", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "400": { description: "VALIDATION_ERROR (limit not 1-50, around together with cursor), INVALID_CURSOR", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "404": { description: "MESSAGE_NOT_FOUND (target not in this channel), TEAM_NOT_FOUND, CHANNEL_NOT_FOUND", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
     post:
       tags: ["Channels and messages"]
       summary: Send a message; with parentId, a reply
       description: |
-        An optional `parentId` makes the message a reply to a message in the same channel; it cannot be changed later.
+        Rate limit: 10 messages per user per 10 seconds, shared by all of the user's devices. A repeated clientMessageId, a 400 and a 404 are not counted. The 429 check runs before anything is saved; the client keeps the message pending, waits for Retry-After and sends it again with the same clientMessageId.
+
+        An optional `parentId` makes the message a reply to a message in the same channel; it cannot be changed later. Sending saves the mentions and creates the notifications; it does not change the author's unread badge. Sends message.created.
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
+              required: [content, clientMessageId]
               properties:
-                clientMessageId: { type: string, minLength: 1, maxLength: 64, description: Idempotency key generated by the client for every new message }
+                content: { type: string, minLength: 1, maxLength: 4000, description: "Plain text, 1-4000 characters after trimming, line breaks allowed" }
+                clientMessageId: { type: string, minLength: 1, maxLength: 64, description: Idempotency key generated by the client for every new message; unique per user }
                 parentId: { type: integer, nullable: true, description: Message being replied to }
       responses:
         "201":
-          description: "TODO (Artūras): as in REST - Channels and messages"
-        "404": { description: "MESSAGE_NOT_FOUND (parent not in channel)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+          description: Message created
+          headers:
+            Location: { schema: { type: string }, description: "/api/v1/messages/{messageId}" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Message" }
+        "200":
+          description: The same clientMessageId was already used by this user; nothing is created and the existing message is returned
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Message" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "404": { description: "MESSAGE_NOT_FOUND (parent not in this channel), TEAM_NOT_FOUND, CHANNEL_NOT_FOUND", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "409": { description: PARENT_MESSAGE_DELETED, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
+  /messages/{messageId}:
+    parameters:
+      - $ref: "#/components/parameters/messageId"
+    get:
+      tags: ["Channels and messages"]
+      summary: Get a message
+      responses:
+        "200":
+          description: Message
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Message" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: ["Channels and messages"]
+      summary: Edit my message (author)
+      description: At most 5 edits per message. Each edit sets editedAt and increments editCount; identical content changes nothing and is not counted. Mentions are recomputed. Sends message.updated.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [content]
+              properties:
+                content: { type: string, minLength: 1, maxLength: 4000 }
+      responses:
+        "200":
+          description: Message
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Message" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "403": { description: "FORBIDDEN (not the author, or a SYSTEM message)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "MESSAGE_DELETED, EDIT_LIMIT_REACHED", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+    delete:
+      tags: ["Channels and messages"]
+      summary: Delete a message (author; Owner and Admin for any user message)
+      description: "The message stays as a placeholder: isDeleted true, content null, deletedAt set, reactions empty. A pinned message is unpinned. Deleting it again returns the same result. Sends message.deleted."
+      responses:
+        "200":
+          description: The message in its deleted state
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Message" }
+        "403": { description: "FORBIDDEN (a Member deleting another user's message, or a SYSTEM message)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
 
   # ---------------------------------------------------------------- Replies, reactions, pins, notifications, search (Rokas)
   /messages/{messageId}/reactions:
@@ -1052,7 +1283,7 @@ paths:
       - $ref: "#/components/parameters/teamId"
     get:
       tags: ["Replies, reactions, pins, notifications, search"]
-      summary: Search messages (Could have)
+      summary: Search messages (Should have)
       description: Case-insensitive substring (% and _ literal); only channels the user can view; no deleted or system messages; newest first. highlights are in UTF-16 code units.
       parameters:
         - { name: q, in: query, required: true, schema: { type: string, minLength: 2, maxLength: 100 } }
@@ -1150,6 +1381,8 @@ components:
     DateFormat: { type: string, enum: [AUTO, DMY, MDY, YMD] }
     TimeFormat: { type: string, enum: [AUTO, H24, H12] }
     TaskStatus: { type: string, enum: [OPEN, IN_PROGRESS, PENDING_REVIEW, DONE] }
+    Availability: { type: string, nullable: true, enum: [AVAILABLE, BUSY, DO_NOT_DISTURB], description: Chosen by the user and shown next to the online status; null = not set }
+    ChannelType: { type: string, enum: [PUBLIC, PRIVATE] }
     RegisteredUser:
       example: {"id": 9, "email": "rokas@example.com", "tag": "rokas", "displayName": "Rokas", "emailVerified": false}
       type: object
@@ -1160,13 +1393,14 @@ components:
         displayName: { type: string }
         emailVerified: { type: boolean, example: false }
     Me:
-      example: {"id": 9, "email": "rokas@example.com", "tag": "rokas", "displayName": "Rokas", "dateFormat": "AUTO", "timeFormat": "H24", "timeZone": "Europe/Vilnius", "createdAt": "2026-10-01T08:00:00.000Z"}
+      example: {"id": 9, "email": "rokas@example.com", "tag": "rokas", "displayName": "Rokas", "availability": null, "dateFormat": "AUTO", "timeFormat": "H24", "timeZone": "Europe/Vilnius", "createdAt": "2026-10-01T08:00:00.000Z"}
       type: object
       properties:
         id: { type: integer }
         email: { type: string }
         tag: { type: string }
         displayName: { type: string }
+        availability: { $ref: "#/components/schemas/Availability" }
         dateFormat: { $ref: "#/components/schemas/DateFormat" }
         timeFormat: { $ref: "#/components/schemas/TimeFormat" }
         timeZone: { type: string, nullable: true }
@@ -1194,12 +1428,13 @@ components:
         myRole: { $ref: "#/components/schemas/Role" }
         memberCount: { type: integer }
     Team:
-      example: {"id": 42, "name": "Vilkai", "myRole": "ADMIN", "createdAt": "2026-09-11T10:00:00.000Z"}
+      example: {"id": 42, "name": "Vilkai", "myRole": "ADMIN", "memberCount": 4, "createdAt": "2026-09-11T10:00:00.000Z"}
       type: object
       properties:
         id: { type: integer }
         name: { type: string }
         myRole: { $ref: "#/components/schemas/Role" }
+        memberCount: { type: integer }
         createdAt: { type: string, format: date-time }
     CreatedTeam:
       example: {"id": 42, "name": "Vilkai", "myRole": "OWNER", "generalChannelId": 12, "createdAt": "2026-09-11T10:00:00.000Z"}
@@ -1218,7 +1453,6 @@ components:
         tag: { type: string }
         displayName: { type: string }
         role: { $ref: "#/components/schemas/Role" }
-        status: { type: string, description: "Availability / presence status. TODO (Artūras): values are defined in Presence and typing indicators." }
         joinedAt: { type: string, format: date-time }
     Invite:
       example: {"id": 118, "teamId": 42, "code": "K7Q2M9XA", "createdBy": {"id": 7, "tag": "pijus", "displayName": "Pijus"}, "createdAt": "2026-10-08T13:47:05.120Z", "expiresAt": "2026-10-15T13:47:05.120Z", "revokedAt": null}
@@ -1227,7 +1461,7 @@ components:
         id: { type: integer, description: "Invite ID (used to revoke it)" }
         teamId: { type: integer }
         code: { type: string, minLength: 8, maxLength: 8, description: "Uppercase letters and digits without look-alike characters (0, O, 1, I, L); unique" }
-        createdBy: { allOf: [{ $ref: "#/components/schemas/UserRef" }], nullable: true }
+        createdBy: { $ref: "#/components/schemas/UserRef" }
         createdAt: { type: string, format: date-time }
         expiresAt: { type: string, format: date-time, description: createdAt + 7 days }
         revokedAt: { type: string, format: date-time, nullable: true }
@@ -1241,16 +1475,40 @@ components:
         title: { type: string, example: Write data model section }
         description: { type: string, example: "" }
         status: { $ref: "#/components/schemas/TaskStatus" }
-        createdBy: { allOf: [{ $ref: "#/components/schemas/UserRef" }], nullable: true, description: null when not set or the user left the team }
-        assignee: { allOf: [{ $ref: "#/components/schemas/UserRef" }], nullable: true, description: null when not set or the user left the team }
+        createdBy: { allOf: [{ $ref: "#/components/schemas/UserRef" }], description: "Never null: users who joined a team are never deleted, so the creator stays on the task even after leaving the team" }
+        assignee: { allOf: [{ $ref: "#/components/schemas/UserRef" }], nullable: true, description: null when unassigned (also when the assignee left the team) }
         dueDate: { type: string, format: date, nullable: true, example: "2026-10-22" }
         reviewComment: { type: string, nullable: true }
         createdAt: { type: string, format: date-time }
         updatedAt: { type: string, format: date-time }
         completedAt: { type: string, format: date-time, nullable: true }
+    Channel:
+      example: {"id": 12, "teamId": 42, "name": "backend", "type": "PUBLIC", "isDefault": false, "createdAt": "2026-10-08T13:47:05.120Z", "createdById": 9}
+      type: object
+      properties:
+        id: { type: integer }
+        teamId: { type: integer }
+        name: { type: string }
+        type: { $ref: "#/components/schemas/ChannelType" }
+        isDefault: { type: boolean, description: "true only for #general, which cannot be renamed, deleted or made private" }
+        createdAt: { type: string, format: date-time }
+        createdById: { type: integer }
+        isMember: { type: boolean, description: "Only in GET /teams/{teamId}/channels?includePrivate=true, false for private channels the Owner / Admin is not a member of" }
+    MessageType: { type: string, enum: [USER, SYSTEM] }
     MessageBase:
       type: object
-      description: "TODO (Artūras): the fields of a message (id, channelId, author, content, type, editCount, editedAt, deletedAt, createdAt...) are defined in REST - Channels and messages."
+      description: "Message fields of REST - Channels and messages. Order: (createdAt, id)."
+      properties:
+        id: { type: integer, example: 902 }
+        channelId: { type: integer, example: 12 }
+        type: { $ref: "#/components/schemas/MessageType" }
+        author: { allOf: [{ $ref: "#/components/schemas/UserRef" }], nullable: true, description: null for SYSTEM messages }
+        content: { type: string, nullable: true, description: "null when deleted; for SYSTEM messages the final text, e.g. @rokas joined the team", example: "@pijus done, please review" }
+        createdAt: { type: string, format: date-time }
+        editedAt: { type: string, format: date-time, nullable: true }
+        editCount: { type: integer, minimum: 0, maximum: 5, example: 0 }
+        isDeleted: { type: boolean, example: false }
+        deletedAt: { type: string, format: date-time, nullable: true }
     MessageAdditions:
       type: object
       description: Fields that every full message object also has (history, message.created / updated / deleted events).
@@ -1351,7 +1609,7 @@ components:
         lastReadAt: { type: string, format: date-time }
         firstUnreadMessageId: { type: integer, nullable: true }
     SearchResult:
-      example: {"messageId": 901, "channel": {"id": 12, "name": "general", "isPrivate": false}, "author": {"id": 7, "tag": "pijus", "displayName": "Pijus"}, "content": "Please finish your sections by Friday", "highlights": [{"start": 7, "length": 6}], "createdAt": "2026-10-08T13:47:05.120Z"}
+      example: {"messageId": 901, "channel": {"id": 12, "name": "general", "type": "PUBLIC"}, "author": {"id": 7, "tag": "pijus", "displayName": "Pijus"}, "content": "Please finish your sections by Friday", "highlights": [{"start": 7, "length": 6}], "createdAt": "2026-10-08T13:47:05.120Z"}
       type: object
       properties:
         messageId: { type: integer }
@@ -1360,7 +1618,7 @@ components:
           properties:
             id: { type: integer }
             name: { type: string }
-            isPrivate: { type: boolean }
+            type: { $ref: "#/components/schemas/ChannelType" }
         author: { allOf: [{ $ref: "#/components/schemas/UserRef" }], nullable: true }
         content: { type: string }
         highlights:
