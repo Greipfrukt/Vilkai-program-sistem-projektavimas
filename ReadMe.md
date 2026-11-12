@@ -256,10 +256,10 @@ Prie žmogaus vardo matosi taškelis, ar jis dabar prisijungęs. Jei atsidarei p
 **FR-021 – Neperskaitytos žinutės** ✅
 Prie kiekvieno kanalo ar pokalbio matosi, kiek naujų žinučių dar neperskaitei. Perskaičius skaičius dingsta, ir tai matosi visuose tavo įrenginiuose.
 
-**FR-022 – Paieška** ❌
+**FR-022 – Paieška** ✅
 Galimybė surasti seną žinutę pagal žodį. Rezultatuose rodomos tik tos žinutės, kurias tau leidžiama matyti.
 
-**FR-023 – Pranešimai programoje** ❌
+**FR-023 – Pranešimai programoje** ✅
 Varpelis, rodantis, kad kažkas tau parašė asmeniškai arba paminėjo tave kanale.
 
 **FR-024 – Failų įkėlimas** ✅
@@ -271,35 +271,35 @@ Failą atsisiųsti gali tik tas, kas mato tą pokalbį. Net jei kažkas turi sen
 **FR-026 – Nepavykę įkėlimai** ✅
 Jei failo įkėlimas nutrūko, jis pažymimas kaip nepavykęs ir negali būti atsisiųstas pusiau sugadintas.
 
-## 4. Bendri dokumentai (pagrindinė Synq ypatybė)
+## 4. Bendri dokumentai (pagrindinė Synq ypatybė) ❌
 
 Įsivaizduokite popieriaus lapą ant stalo, prie kurio sėdi keli žmonės ir visi tuo pačiu metu rašo į jį savo dalis. Kiekvienas mato, ką kiti rašo, ir niekas nieko neištrina netyčia. Synq tai daro internetu.
 
-**FR-027 – Dokumento sukūrimas** ✅
+**FR-027 – Dokumento sukūrimas** ❌
 Kanalo nariai gali sukurti dokumentą su pavadinimu. Jį vėliau galima atsidaryti iš kanalo. Kitų kanalų žmonės jo nemato.
 
-**FR-028 – Kas gali redaguoti** ✅
+**FR-028 – Kas gali redaguoti** ❌
 Redaguoti gali tik tie, kas gali rašyti tame kanale. Archyvuotame kanale dokumentą galima tik skaityti.
 
-**FR-029 – Rašymas vienu metu** ✅
+**FR-029 – Rašymas vienu metu** ❌
 Bent trys žmonės gali rašyti tą patį dokumentą vienu metu ir mato vieni kitų pakeitimus iš karto.
 
-**FR-030 – Jokių konfliktų** ✅
+**FR-030 – Jokių konfliktų** ❌
 Jei du žmonės tą pačią akimirką keičia tą pačią vietą, sistema pati sujungia abu pakeitimus ir nė vieno neprarandama. Visiems galiausiai rodomas lygiai tas pats tekstas.
 
-**FR-031 – Atsidarius matai naujausią versiją** ✅
+**FR-031 – Atsidarius matai naujausią versiją** ❌
 Atsidaręs dokumentą iš karto matai naujausią tekstą ir toliau gauni kitų pakeitimus. Uždarius – nebegauni.
 
-**FR-032 – Niekas nedingsta** ✅
+**FR-032 – Niekas nedingsta** ❌
 Viskas, ką parašei, išsaugoma automatiškai. Net jei perkrausi puslapį ar sugrius vienas mūsų serveris, tekstas liks.
 
-**FR-033 – Dingus internetui** ✅
+**FR-033 – Dingus internetui** ❌
 Jei dingo internetas, programa parodo, kad ryšio nėra. Grįžus ryšiui ji pati atsisiunčia, ką praleidai, ir išsiunčia, ką parašei per tą laiką. Jei ko nors nepavyko išsiųsti, tai aiškiai pažymima, o ne tyliai prarandama.
 
-**FR-034 – Matai, kas dar rašo** ✅
+**FR-034 – Matai, kas dar rašo** ❌
 Dokumente matosi, kas dar jį dabar atsidaręs, ir kur kiekvienas yra su savo žymekliu (spalvotas brūkšnelis su vardu). Žmogui išėjus, jis po kelių sekundžių dingsta iš sąrašo.
 
-**FR-035 – Apsauga nuo sugadinimo** ✅
+**FR-035 – Apsauga nuo sugadinimo** ❌
 Dokumentas gali būti iki 100 000 simbolių (maždaug 50 puslapių). Sistema tikrina kiekvieną pakeitimą, kad niekas negalėtų tyčia ar netyčia sugadinti teksto.
 
 **FR-036 – Teksto formatavimas** ❌
@@ -308,7 +308,7 @@ Paryškintas, pasviręs tekstas, antraštės. Pirmoje versijoje – tik paprasta
 **FR-037 – Ilgas darbas be interneto** ❌
 Galimybė ilgai rašyti be interneto ir vėliau viską sujungti.
 
-**FR-038 – Dokumento pervadinimas ir trynimas** ✅
+**FR-038 – Dokumento pervadinimas ir trynimas** ❌
 Dokumento kūrėjas, administratorius ar savininkas gali jį pervadinti arba ištrinti. Ištrynus, visiems jį atsidariusiems jis užsidaro.
 
 **FR-039 – Versijų istorija** ❌
