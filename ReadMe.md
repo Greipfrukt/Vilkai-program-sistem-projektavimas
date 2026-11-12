@@ -148,3 +148,184 @@ TBD
 - **Testuoti per 2 instancijas nuo pirmos dienos**, ne paskutinę savaitę – tai pagrindinis kurso reikalavimas.
 - **Acceptance kriterijai = testų sąrašas.** Kiekvienam MUST FR – bent vienas automatinis testas.
 - **Dokumentaciją taisyti kartu su kodu:** pataisytos klaidos iš 3 skyriaus turi atsispindėti specifikacijoje prieš gynimą.
+
+
+
+
+### SUMMARY
+# Synq paprastais žodžiais
+
+## Kas yra Synq?
+
+Synq – tai **internetinė programa komandoms**, kurioje galima **susirašinėti** ir **kartu rašyti tekstą**, nepereinant į kitas programas. Panašiai kaip Slack, Microsoft Teams ar Discord, tik dar su bendrais dokumentais, kuriuos keli žmonės gali rašyti vienu metu (kaip Google Docs).
+
+**Kokią problemą tai sprendžia?** Dabar komandos dažnai kalbasi vienoje programoje, failus siunčiasi el. paštu, o dokumentus rašo dar kitur. Dėl to:
+- reikia nuolat šokinėti tarp programų;
+- atsiranda kelios to paties dokumento versijos ir dalis darbo pasimeta;
+- neaišku, kas šiuo metu prisijungęs, ką dar perskaitei ir kas ką redaguoja.
+
+Synq viską sudeda į vieną vietą.
+
+## Keli žodžiai, kuriuos reikia žinoti
+
+| Žodis | Ką reiškia |
+|---|---|
+| **Darbo erdvė** (workspace) | Atskira komandos „patalpa“, pvz. vienos įmonės ar studentų grupės. Vienas žmogus gali būti keliose. |
+| **Kanalas** | Pokalbių „kambarys“ darbo erdvėje tam tikra tema, pvz. #marketingas. Būna **viešas** (gali prisijungti kiekvienas komandos narys) arba **privatus** (tik pakviesti). |
+| **Asmeninis pokalbis** | Susirašinėjimas tarp dviejų žmonių. |
+| **Grupinis pokalbis** | Susirašinėjimas tarp 3–20 žmonių, ne kanale. |
+| **Savininkas** | Žmogus, sukūręs darbo erdvę. Visada būna tik vienas. |
+| **Administratorius** | Savininko paskirtas „prižiūrėtojas“: kviečia žmones, kuria kanalus. |
+| **Narys** | Paprastas dalyvis. |
+| **Bendras dokumentas** | Tekstas kanale, kurį keli žmonės gali rašyti tuo pačiu metu. |
+
+## Žymėjimas
+
+- ✅ **Darom** – bus pirmoje versijoje.
+- 🟡 **Jei liks laiko** – darysime, jei spėsime.
+- ❌ **Atidėta** – ne šioje versijoje.
+
+---
+
+## 1. Paskyra ir darbo erdvės
+
+**FR-001 – Registracija ir prisijungimas** ✅
+Žmogus susikuria paskyrą su el. paštu, vardu ir slaptažodžiu (bent 8 simboliai). Tuo pačiu el. paštu antros paskyros sukurti negalima. Jei prisijungiant suklystama, sistema nesako, kas tiksliai neteisinga, kad pašaliniam būtų sunkiau atspėti.
+
+**FR-002 – Prisijungimo sesija** ✅
+Prisijungus sistema tave „atsimena“, kol neatsijungi arba kol baigiasi laikas. Atsijungus ar praėjus laikui nieko nebegali matyti, kol neprisijungsi iš naujo.
+
+**FR-003 – Profilis** ✅
+Gali pasikeisti savo rodomą vardą ir profilio nuotrauką. El. pašto pakeisti negalima.
+
+**FR-004 – Darbo erdvės kūrimas** ✅
+Bet kas gali susikurti savo darbo erdvę ir tampa jos savininku. Kiekviena darbo erdvė turi savo žmones ir kanalus, kurių kitų erdvių žmonės nemato.
+
+**FR-005 – Kvietimai** ✅
+Savininkas ar administratorius sukuria kvietimo nuorodą konkrečiam el. paštui ir ją nusiunčia žmogui pats. Nuoroda galioja 7 dienas ir tik vieną kartą. Kitu el. paštu ja pasinaudoti negalima.
+
+**FR-006 – Rolių keitimas** ✅
+Tik savininkas gali paskirti ar atimti administratoriaus teises. Savininkas visada lieka vienas.
+
+**FR-007 – Išėjimas ar pašalinimas** ✅
+Narys gali pats išeiti iš darbo erdvės. Administratorius gali pašalinti narius, o savininkas – ir administratorius. Savininkas, prieš išeidamas, turi kam nors perduoti savininko teises. Pašalintas žmogus iš karto nebemato nieko, net jei programa pas jį dar atidaryta.
+
+**FR-008 – Naršymas** ✅
+Matai visas savo darbo erdves ir gali tarp jų persijungti, kaip tarp skirtukų. Vienos erdvės informacija niekada nesimaišo su kita.
+
+## 2. Kanalai ir žinutės
+
+**FR-009 – Kanalai** ✅
+Savininkas ir administratoriai kuria kanalus, juos pervadina ir archyvuoja. Dviejų kanalų tuo pačiu pavadinimu būti negali. Archyvuotas kanalas – kaip užrakinta spinta su stiklinėmis durimis: senas žinutes matyti galima, rašyti naujų – ne.
+
+**FR-010 – Privatūs kanalai** ✅
+Privatų kanalą mato tik ten pakviesti žmonės (ir savininkas su administratoriais). Kiti net nežino, kad toks kanalas yra.
+
+**FR-011 – Žinutės siuntimas** ✅
+Gali parašyti žinutę iki 4000 simbolių (maždaug dviejų puslapių) ir prisegti iki 5 failų. Galima siųsti ir vien failą be teksto. Žinutė neišnyksta perkrovus puslapį.
+
+**FR-012 – Žinutės ateina iš karto** ✅
+Kai kas nors parašo, kiti tą žinutę pamato iš karto, be puslapio perkrovimo. Taip yra net tada, kai žmonės prisijungę prie skirtingų mūsų serverių.
+
+**FR-013 – Žinučių istorija ir „pasivijimas“** ✅
+Gali paslinkti aukštyn ir pamatyti senesnes žinutes. Jei trumpam dingo internetas, prisijungus vėl gauni viską, ką praleidai, ir nieko du kartus.
+
+**FR-014 – Jokių dublikatų ir teisinga tvarka** ✅
+Jei internetas strigo ir programa žinutę išsiuntė dar kartą, ji vis tiek atsiras tik vieną kartą. Visi pokalbio dalyviai mato žinutes ta pačia tvarka.
+
+**FR-015 – Asmeniniai ir grupiniai pokalbiai** ✅
+Gali susirašinėti su vienu žmogumi arba su grupele (3–20 žmonių) iš tos pačios darbo erdvės. Kiti jūsų pokalbio nemato.
+
+**FR-016 – Žinučių taisymas ir trynimas** ✅ (tik savo žinučių) / 🟡 (administratoriams – kitų žinučių)
+Gali pataisyti ar ištrinti savo žinutę. Pataisyta žinutė pažymima „redaguota“, o vietoje ištrintos lieka užrašas, kad ji buvo ištrinta. Administratorius kanale gali ištrinti netinkamas kitų žinutes, bet asmeninių pokalbių neliečia.
+
+**FR-017 – Atsakymai gijose (threads)** ❌
+Galimybė atsakyti į konkrečią žinutę atskirame šoniniame lange, kad pagrindinis pokalbis neužsikimštų.
+
+**FR-018 – Reakcijos** ✅
+Gali „paspausti“ šypsenėlę ar 👍 po žinute vietoj atsakymo. Matosi, kiek žmonių sureagavo. Tos pačios šypsenėlės vienas žmogus du kartus uždėti negali.
+
+**FR-019 – Moderavimo žurnalas** 🟡
+Kai administratorius ištrina kieno nors žinutę ar archyvuoja kanalą, sistema užsirašo kas, ką ir kada padarė, kaip apsaugos kameros įrašas.
+
+## 3. Kas prisijungęs, kas neperskaityta, failai
+
+**FR-020 – Prisijungęs ar ne** ✅
+Prie žmogaus vardo matosi taškelis, ar jis dabar prisijungęs. Jei atsidarei programą ir telefone, ir kompiuteryje, būsi „prisijungęs“, kol uždarysi abi.
+
+**FR-021 – Neperskaitytos žinutės** ✅
+Prie kiekvieno kanalo ar pokalbio matosi, kiek naujų žinučių dar neperskaitei. Perskaičius skaičius dingsta, ir tai matosi visuose tavo įrenginiuose.
+
+**FR-022 – Paieška** ❌
+Galimybė surasti seną žinutę pagal žodį. Rezultatuose rodomos tik tos žinutės, kurias tau leidžiama matyti.
+
+**FR-023 – Pranešimai programoje** ❌
+Varpelis, rodantis, kad kažkas tau parašė asmeniškai arba paminėjo tave kanale.
+
+**FR-024 – Failų įkėlimas** ✅
+Prie žinutės gali prisegti nuotrauką (PNG, JPEG), PDF ar tekstinį failą, iki 10 MB. Kitų tipų ir didesnių failų sistema nepriims.
+
+**FR-025 – Failų apsauga** ✅
+Failą atsisiųsti gali tik tas, kas mato tą pokalbį. Net jei kažkas turi seną failo nuorodą, bet buvo pašalintas iš kanalo, atsisiųsti nebegalės.
+
+**FR-026 – Nepavykę įkėlimai** ✅
+Jei failo įkėlimas nutrūko, jis pažymimas kaip nepavykęs ir negali būti atsisiųstas pusiau sugadintas.
+
+## 4. Bendri dokumentai (pagrindinė Synq ypatybė)
+
+Įsivaizduokite popieriaus lapą ant stalo, prie kurio sėdi keli žmonės ir visi tuo pačiu metu rašo į jį savo dalis. Kiekvienas mato, ką kiti rašo, ir niekas nieko neištrina netyčia. Synq tai daro internetu.
+
+**FR-027 – Dokumento sukūrimas** ✅
+Kanalo nariai gali sukurti dokumentą su pavadinimu. Jį vėliau galima atsidaryti iš kanalo. Kitų kanalų žmonės jo nemato.
+
+**FR-028 – Kas gali redaguoti** ✅
+Redaguoti gali tik tie, kas gali rašyti tame kanale. Archyvuotame kanale dokumentą galima tik skaityti.
+
+**FR-029 – Rašymas vienu metu** ✅
+Bent trys žmonės gali rašyti tą patį dokumentą vienu metu ir mato vieni kitų pakeitimus iš karto.
+
+**FR-030 – Jokių konfliktų** ✅
+Jei du žmonės tą pačią akimirką keičia tą pačią vietą, sistema pati sujungia abu pakeitimus ir nė vieno neprarandama. Visiems galiausiai rodomas lygiai tas pats tekstas.
+
+**FR-031 – Atsidarius matai naujausią versiją** ✅
+Atsidaręs dokumentą iš karto matai naujausią tekstą ir toliau gauni kitų pakeitimus. Uždarius – nebegauni.
+
+**FR-032 – Niekas nedingsta** ✅
+Viskas, ką parašei, išsaugoma automatiškai. Net jei perkrausi puslapį ar sugrius vienas mūsų serveris, tekstas liks.
+
+**FR-033 – Dingus internetui** ✅
+Jei dingo internetas, programa parodo, kad ryšio nėra. Grįžus ryšiui ji pati atsisiunčia, ką praleidai, ir išsiunčia, ką parašei per tą laiką. Jei ko nors nepavyko išsiųsti, tai aiškiai pažymima, o ne tyliai prarandama.
+
+**FR-034 – Matai, kas dar rašo** ✅
+Dokumente matosi, kas dar jį dabar atsidaręs, ir kur kiekvienas yra su savo žymekliu (spalvotas brūkšnelis su vardu). Žmogui išėjus, jis po kelių sekundžių dingsta iš sąrašo.
+
+**FR-035 – Apsauga nuo sugadinimo** ✅
+Dokumentas gali būti iki 100 000 simbolių (maždaug 50 puslapių). Sistema tikrina kiekvieną pakeitimą, kad niekas negalėtų tyčia ar netyčia sugadinti teksto.
+
+**FR-036 – Teksto formatavimas** ❌
+Paryškintas, pasviręs tekstas, antraštės. Pirmoje versijoje – tik paprastas tekstas.
+
+**FR-037 – Ilgas darbas be interneto** ❌
+Galimybė ilgai rašyti be interneto ir vėliau viską sujungti.
+
+**FR-038 – Dokumento pervadinimas ir trynimas** ✅
+Dokumento kūrėjas, administratorius ar savininkas gali jį pervadinti arba ištrinti. Ištrynus, visiems jį atsidariusiems jis užsidaro.
+
+**FR-039 – Versijų istorija** ❌
+Galimybė pažiūrėti, kaip dokumentas atrodė anksčiau, ir sugrąžinti senesnę versiją.
+
+---
+
+## Santrauka
+
+| Sritis | Ką gali daryti žmogus | Pirmoje versijoje |
+|---|---|---|
+| Paskyra | Užsiregistruoti, prisijungti, pasikeisti vardą ir nuotrauką | ✅ |
+| Komanda | Sukurti darbo erdvę, pakviesti žmones, paskirti administratorius | ✅ |
+| Pokalbiai | Rašyti kanaluose, asmeniškai ir grupėse; prisegti failus | ✅ |
+| Patogumai | Taisyti ir trinti žinutes, reaguoti šypsenėlėmis | ✅ |
+| Būsena | Matyti, kas prisijungęs ir kiek neperskaitytų žinučių | ✅ |
+| Dokumentai | Rašyti tą patį tekstą keliese vienu metu, nieko neprarandant | ❌ |
+| Vėliau | Gijos, paieška, pranešimai, formatavimas, versijų istorija | ❌ |
+
+**Ko Synq pirmoje versijoje nedarys:** skambučių ir vaizdo pokalbių, programėlių telefonui, el. laiškų pranešimų, piešimo lentų, mokamų planų ir dirbtinio intelekto funkcijų.
