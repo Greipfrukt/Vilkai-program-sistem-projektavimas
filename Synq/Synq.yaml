@@ -1,0 +1,2839 @@
+openapi: 3.0.3
+info:
+  title: Synq Public REST API
+  version: 1.0.0
+  description: |
+    Complete interface contract of Synq V1 (specification Section 6, 6.1-6.6): public REST API,
+    the two WebSocket protocols, internal service API, health endpoints and broker events.
+
+    ## Implementation scope
+    The database, broker, cache and object-storage products in this specification (including PostgreSQL,
+    RabbitMQ, Redis and S3-compatible storage) are examples for the reference deployment, not mandatory vendors.
+    Equivalent products are permitted if all functional, reliability, security and consistency requirements hold.
+
+    Workspace roles are OWNER, ADMINISTRATOR and MEMBER. There is no separate channel-specific management role.
+    Only a workspace OWNER or ADMINISTRATOR may create, rename or archive channels and manage private-channel
+    participants. Only the OWNER may assign or remove ADMINISTRATOR roles.
+
+    ## Common REST conventions
+    | Topic | Rule |
+    |---|---|
+    | Versioning | All public paths under `/api/v1`. New optional fields are non-breaking; clients ignore unknown fields. Breaking changes go to `/api/v2`; v1 stays at least 3 months. |
+    | Format | JSON UTF-8, camelCase, UUID ids, ISO-8601 UTC timestamps with ms (`2026-11-06T09:15:30.123Z`), field names ending in `Utc`. Lengths in Unicode code points after trimming. |
+    | URLs | Plural concrete nouns, no verbs; collection URL + element URL per resource. |
+    | Authentication | `synq_session` cookie (see *sessionCookie*). **401** = no valid session, **403** = signed in but not allowed; 403 never contains protected content. |
+    | Pagination | `offset` (default 0) + `limit` (default 50, max 100) → `{items, total, offset, limit}`. Message history and replies page by `seq` instead. |
+    | Sorting / filtering | `sort=-createdAtUtc,name` (`-` = descending; unknown field → 400). One query parameter per filter field. Free-text search = `q`. |
+    | Caching | Workspace content: `Cache-Control: no-store`. Avatars: `private, max-age=300` + `ETag`, `If-None-Match` → 304. |
+    | Correlation | `X-Correlation-Id` set by gateway if missing, forwarded to services and events, returned on every response and in every error body. |
+    | Limits | JSON body ≤ 64 KiB (413). 300 requests/min per session; 20 sent messages per 10 s per user → 429 + `Retry-After`. |
+
+    ## Gateway routing (most specific pattern wins)
+    | Public path | Service |
+    |---|---|
+    | `/users/**`, `/sessions/**` | Auth |
+    | `/workspaces`, `/workspaces/{id}`, `.../members/**`, `.../ownership-transfers`, `.../invitations/**`, `.../channels`, `/channels/{id}`, `/channels/{id}/participants/**`, `/invitations/**` | Workspace |
+    | `/workspaces/{id}/conversations`, `/conversations/**`, `/messages/**`, `/ws` | Messaging (2+ instances) |
+    | `/workspaces/{id}/presence` | Presence |
+    | `/channels/{id}/documents`, `/documents/**`, `/ws/documents/{id}` | Collaboration (2+ instances) |
+    | `/workspaces/{id}/files`, `/files/**` | File |
+    | `/workspaces/{id}/search/**` | Search (SHOULD) |
+    | `/notifications/**` | Notification (SHOULD) |
+
+    `/internal/**` and `/health/**` are reachable only on the private Docker network and never routed by the gateway.
+
+    ## Error code catalogue
+    | Code | HTTP | Meaning |
+    |---|---|---|
+    | BAD_REQUEST | 400 | Malformed JSON or invalid parameter |
+    | AUTH_REQUIRED | 401 | No session cookie |
+    | SESSION_EXPIRED | 401 | Session expired or revoked |
+    | INVALID_CREDENTIALS | 401 | Wrong email or password (generic) |
+    | FORBIDDEN | 403 | No permission for this action |
+    | CHANNEL_ARCHIVED | 403 | Write to an archived channel |
+    | INVITATION_EMAIL_MISMATCH | 403 | Invitation issued to another email |
+    | NOT_FOUND | 404 | Resource does not exist or was deleted |
+    | METHOD_NOT_ALLOWED | 405 | Verb not supported |
+    | EMAIL_TAKEN | 409 | Email already registered |
+    | CHANNEL_NAME_TAKEN | 409 | Channel name already used in workspace |
+    | ALREADY_MEMBER | 409 | Already a workspace member |
+    | INVITATION_USED / INVITATION_EXPIRED / INVITATION_REVOKED | 409 | Invitation can no longer be used |
+    | OWNER_MUST_TRANSFER | 409 | Owner tried to leave or be removed |
+    | EDIT_CONFLICT | 409 | Message changed since `expectedEditVersion` |
+    | FILE_NOT_READY | 409 | File still uploading or failed |
+    | FILE_ATTACHED | 409 | Attached file cannot be cancelled |
+    | PAYLOAD_TOO_LARGE / FILE_TOO_LARGE | 413 | Body or file above limit |
+    | UNSUPPORTED_MEDIA_TYPE | 415 | File type not allowed |
+    | VALIDATION_FAILED | 422 | Field errors, see `fieldErrors` |
+    | NOT_A_MEMBER | 422 | Target user is not a workspace member |
+    | ATTACHMENT_NOT_READY | 422 | Attachment not READY / other conversation / other uploader |
+    | UNKNOWN_EMOJI | 422 | Emoji shortcode not supported |
+    | USE_OWNERSHIP_TRANSFER / UNARCHIVE_NOT_SUPPORTED | 422 | Operation not allowed through this endpoint |
+    | RATE_LIMITED | 429 | Too many requests |
+    | INTERNAL_ERROR | 500 | Unexpected error |
+    | DEPENDENCY_UNAVAILABLE | 503 | Required service, DB or broker unavailable |
+    | GATEWAY_TIMEOUT | 504 | Service did not answer in time |
+
+    ## Idempotency of client operations
+    | Operation | Key | Duplicate behaviour |
+    |---|---|---|
+    | Send message | unique (conversationId, clientRequestId) | 200 + original message, no new event |
+    | Upload file | unique (uploaderId, clientRequestId) | 200 + original metadata |
+    | Document update | unique (documentId, updateId) | `update.ack` with `duplicate: true`, no re-broadcast |
+    | Add/remove reaction | (messageId, userId, emoji) | PUT/DELETE repeatable |
+    | Read cursor | monotonic maximum | lower value ignored |
+    | Create DIRECT conversation | sorted participant pair | 200 + existing conversation |
+    | Accept invitation | single-use | 409 INVITATION_USED / ALREADY_MEMBER |
+    | Create notification | unique (recipientUserId, sourceEventId) | created once |
+
+    `clientRequestId` and `updateId` are client-generated UUIDs, reused on every retry until acknowledged.
+
+    ## Error handling between services
+    - Internal synchronous calls: 2 s timeout; idempotent GETs retried once after 200 ms.
+    - Permission checks **fail closed**: unknown result → 503 DEPENDENCY_UNAVAILABLE, never "allowed".
+    - Gateway: 10 s per request (60 s uploads) → 504; no healthy instance → 503 + `Retry-After: 5`.
+    - Clients retry 5xx/network errors only for idempotent requests or with the same idempotency key; 429 after `Retry-After`; never other 4xx. UI shows the action as failed, not saved (NFR-014).
+
+    ## Broker and events (RabbitMQ reference example)
+    The queue/exchange names below describe the reference deployment. Any broker with equivalent reliable
+    delivery, acknowledgement, at-least-once retry, deduplication and live fan-out semantics is acceptable.
+    | Element | Configuration | Purpose |
+    |---|---|---|
+    | Exchange `synq.events` | topic, durable, routing key = eventType | All domain events, published via outbox |
+    | Durable service queues | `messaging.events`, `collaboration.events`, `search.events`, `notification.events`, `file.events`, `presence.events`; instances of one service compete | State changes that must not be lost |
+    | Live fan-out queues | `messaging.live.<instanceId>`, `collaboration.live.<instanceId>`; exclusive, auto-delete | Each instance pushes to its own clients; loss on restart is harmless (clients catch up) |
+    | Exchange `synq.transient` | topic, non-durable | `presence.changed`, `document.awareness` |
+    | Retry / DLQ | delays 1, 2, 4, 8, 16 s; after 5th failure → `synq.dlq` | Poison events logged with correlationId |
+
+    **Outbox:** state change + `outbox` row in one transaction; relay polls every 200 ms, publishes with publisher confirms,
+    sets `publishedAtUtc`. Delivery is at-least-once. Broker down → commands still succeed, events published later.
+
+    **Consumers:** durable consumers insert (consumerName, eventId) into `processed_event` in the same transaction (kept 7 days);
+    live consumers deduplicate in memory (message id/seq, document updateId).
+
+    **Ordering:** messages by `seq`; edits only if `editVersion` higher; memberships/channels only if
+    `membershipVersion`/`channelVersion` higher; read cursors keep max; Yjs updates commute (seq gap → reload from DB).
+
+    **Revocation:** on `workspace.member-removed` / `channel.participant-removed` all Messaging and Collaboration instances drop
+    affected subscriptions within 5 s (NFR-008): `access.revoked` on the messaging socket, close 4003 on document sockets.
+
+    The event catalogue and payloads are the `Event*` schemas under *Schemas*; the WebSocket frames are the `Ws*` schemas.
+servers:
+  - url: http://localhost:8080/api/v1
+    description: Local Docker Compose deployment
+  - url: https://{host}/api/v1
+    description: Non-local deployment (TLS required)
+    variables:
+      host:
+        default: synq.example.com
+security:
+  - sessionCookie: []
+tags:
+  - name: Auth
+    description: Auth Service - registration, sessions, profiles (6.1)
+  - name: Workspaces
+    description: Workspace Service - workspaces, members, invitations (6.2)
+  - name: Channels
+    description: Workspace Service - channels and participants (6.2)
+  - name: Messaging
+    description: Messaging Service - conversations, messages, reactions, read state (6.3)
+  - name: Presence
+    description: Presence Service - online status (6.3)
+  - name: Documents
+    description: Collaboration Service - shared documents metadata (6.4)
+  - name: Files
+    description: File Service - attachments (6.5)
+  - name: Search
+    description: Search Service (SHOULD) - message search (6.5)
+  - name: Notifications
+    description: Notification Service (SHOULD) - in-app notifications (6.5)
+  - name: WebSocket - Messaging
+    description: Live messaging protocol (6.3). Frames are WsFrame JSON text frames; payload schemas are Ws* in Schemas.
+  - name: WebSocket - Documents
+    description: Document sync protocol with Yjs (6.4). Binary Yjs data is standard base64 inside JSON frames.
+  - name: Internal
+    description: Synchronous service-to-service API (6.6). Private network only, requires X-Internal-Token.
+  - name: Health
+    description: Liveness and readiness of every service (NFR-015). Private network only.
+
+paths:
+  # ---------------------------------------------------------------- Auth (6.1)
+  /users:
+    post:
+      tags: [Auth]
+      operationId: registerUser
+      summary: Register a new account and sign in (FR-001)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RegisterRequest' }
+            example: { email: alice@example.com, displayName: Alice, password: correct-horse-1 }
+      responses:
+        '201':
+          description: Account created; session cookie set.
+          headers:
+            Set-Cookie: { $ref: '#/components/headers/SetSessionCookie' }
+            Location: { $ref: '#/components/headers/Location' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SessionInfo' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /sessions:
+    post:
+      tags: [Auth]
+      operationId: signIn
+      summary: Sign in (FR-001, FR-002)
+      description: Wrong email and wrong password return the same 401 INVALID_CREDENTIALS. 10 failed attempts per email in 15 minutes return 429.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SignInRequest' }
+      responses:
+        '201':
+          description: Session created; session cookie set.
+          headers:
+            Set-Cookie: { $ref: '#/components/headers/SetSessionCookie' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SessionInfo' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /sessions/current:
+    get:
+      tags: [Auth]
+      operationId: getCurrentSession
+      summary: Current session and user
+      responses:
+        '200':
+          description: Session is valid.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SessionInfo' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    delete:
+      tags: [Auth]
+      operationId: signOut
+      summary: Sign out; revokes the session and closes its WebSockets (FR-002)
+      responses:
+        '204':
+          description: Signed out; cookie cleared.
+          headers:
+            Set-Cookie:
+              description: '`synq_session=; Max-Age=0; Path=/api`'
+              schema: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /users/me:
+    get:
+      tags: [Auth]
+      operationId: getMyProfile
+      summary: Own profile including email
+      responses:
+        '200':
+          description: Own profile.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OwnUser' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    patch:
+      tags: [Auth]
+      operationId: updateMyProfile
+      summary: Change display name (FR-003)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateProfileRequest' }
+      responses:
+        '200':
+          description: Updated profile.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OwnUser' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /users/me/avatar:
+    put:
+      tags: [Auth]
+      operationId: uploadMyAvatar
+      summary: Upload or replace profile image (FR-003)
+      description: PNG or JPEG detected from content, max 2 MiB, max 4096x4096 pixels.
+      requestBody:
+        required: true
+        content:
+          image/png:
+            schema: { type: string, format: binary }
+          image/jpeg:
+            schema: { type: string, format: binary }
+      responses:
+        '200':
+          description: Image stored.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OwnUser' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+    delete:
+      tags: [Auth]
+      operationId: deleteMyAvatar
+      summary: Remove profile image
+      responses:
+        '204': { description: Image removed. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /users/{userId}:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    get:
+      tags: [Auth]
+      operationId: getUser
+      summary: Public profile of a user who shares a workspace with me
+      responses:
+        '200':
+          description: Public profile (no email).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PublicUser' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /users/{userId}/avatar:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    get:
+      tags: [Auth]
+      operationId: getUserAvatar
+      summary: Profile image bytes
+      parameters:
+        - name: If-None-Match
+          in: header
+          required: false
+          schema: { type: string }
+      responses:
+        '200':
+          description: Image.
+          headers:
+            ETag:
+              schema: { type: string }
+            Cache-Control:
+              schema: { type: string, example: 'private, max-age=300' }
+          content:
+            image/png:
+              schema: { type: string, format: binary }
+            image/jpeg:
+              schema: { type: string, format: binary }
+        '304': { description: Not modified. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---------------------------------------------------------- Workspaces (6.2)
+  /workspaces:
+    post:
+      tags: [Workspaces]
+      operationId: createWorkspace
+      summary: Create a workspace; creator becomes Owner (FR-004)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateWorkspaceRequest' }
+      responses:
+        '201':
+          description: Workspace created.
+          headers:
+            Location: { $ref: '#/components/headers/Location' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Workspace' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+    get:
+      tags: [Workspaces]
+      operationId: listMyWorkspaces
+      summary: Workspaces I belong to (FR-008)
+      parameters:
+        - $ref: '#/components/parameters/Offset'
+        - $ref: '#/components/parameters/Limit'
+        - name: sort
+          in: query
+          description: 'Sortable: name, createdAtUtc. Default: name.'
+          schema: { type: string, default: name }
+      responses:
+        '200':
+          description: Page of workspaces.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkspacePage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /workspaces/{workspaceId}:
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceId'
+    get:
+      tags: [Workspaces]
+      operationId: getWorkspace
+      summary: Workspace details
+      responses:
+        '200':
+          description: Workspace.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Workspace' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /workspaces/{workspaceId}/members:
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceId'
+    get:
+      tags: [Workspaces]
+      operationId: listMembers
+      summary: Workspace members (FR-008)
+      description: '`email` is included only when the caller is Owner or Administrator.'
+      parameters:
+        - name: role
+          in: query
+          schema: { $ref: '#/components/schemas/WorkspaceRole' }
+        - $ref: '#/components/parameters/Q'
+        - $ref: '#/components/parameters/Offset'
+        - $ref: '#/components/parameters/Limit'
+        - name: sort
+          in: query
+          description: 'Sortable: displayName, joinedAtUtc. Default: displayName.'
+          schema: { type: string, default: displayName }
+      responses:
+        '200':
+          description: Page of members.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MemberPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Workspaces]
+      operationId: joinWorkspace
+      summary: Join a workspace by accepting an invitation (FR-005)
+      description: Exactly one of invitationToken or invitationId. The signed-in user's email must match the invitation.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/JoinWorkspaceRequest' }
+      responses:
+        '201':
+          description: Membership created with role MEMBER.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Member' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /workspaces/{workspaceId}/members/{userId}:
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceId'
+      - $ref: '#/components/parameters/UserId'
+    patch:
+      tags: [Workspaces]
+      operationId: changeMemberRole
+      summary: Workspace Owner assigns/removes ADMINISTRATOR role (FR-006)
+      description: Only the workspace OWNER may change a MEMBER to ADMINISTRATOR or back. An ADMINISTRATOR cannot assign or remove other administrators, including themselves. Ownership transfer uses the dedicated endpoint.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ChangeRoleRequest' }
+      responses:
+        '200':
+          description: Updated membership.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Member' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+    delete:
+      tags: [Workspaces]
+      operationId: removeMember
+      summary: Remove a workspace member or leave the workspace (FR-007)
+      description: Any non-OWNER workspace user may leave their own workspace. An ADMINISTRATOR may remove MEMBERs only; only the OWNER may remove an ADMINISTRATOR. The OWNER cannot leave without transferring ownership first. Revocation removes all channel and document access.
+      responses:
+        '204': { description: Membership removed; access revoked. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /workspaces/{workspaceId}/ownership-transfers:
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceId'
+    post:
+      tags: [Workspaces]
+      operationId: transferOwnership
+      summary: Transfer ownership; previous Owner becomes ADMINISTRATOR (FR-006)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [newOwnerUserId]
+              properties:
+                newOwnerUserId: { type: string, format: uuid }
+      responses:
+        '201':
+          description: Ownership transferred.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Workspace' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /workspaces/{workspaceId}/invitations:
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceId'
+    post:
+      tags: [Workspaces]
+      operationId: createInvitation
+      summary: Invite a user by email (FR-005)
+      description: Returns the invitation link once. A pending invitation for the same email is revoked and replaced.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, format: email, maxLength: 254 }
+      responses:
+        '201':
+          description: Invitation created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CreatedInvitation' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+    get:
+      tags: [Workspaces]
+      operationId: listWorkspaceInvitations
+      summary: Pending invitations of the workspace
+      parameters:
+        - $ref: '#/components/parameters/Offset'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Page of invitations.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/InvitationPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /workspaces/{workspaceId}/invitations/{invitationId}:
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceId'
+      - name: invitationId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    delete:
+      tags: [Workspaces]
+      operationId: revokeInvitation
+      summary: Revoke a pending invitation
+      responses:
+        '204': { description: Revoked. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /invitations:
+    get:
+      tags: [Workspaces]
+      operationId: listMyInvitations
+      summary: Pending invitations addressed to my email
+      parameters:
+        - $ref: '#/components/parameters/Offset'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Page of invitations.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/InvitationPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /invitations/{token}:
+    parameters:
+      - name: token
+        in: path
+        required: true
+        description: Invitation token from the link (base64url, 43 characters).
+        schema: { type: string, pattern: '^[A-Za-z0-9_-]{43}$' }
+    get:
+      tags: [Workspaces]
+      operationId: previewInvitation
+      summary: Preview an invitation before signing in
+      security: []
+      responses:
+        '200':
+          description: Preview.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/InvitationPreview' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ------------------------------------------------------------ Channels (6.2)
+  /workspaces/{workspaceId}/channels:
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceId'
+    post:
+      tags: [Channels]
+      operationId: createChannel
+      summary: Owner/Administrator creates a public or private channel (FR-009)
+      description: Requires workspace OWNER or ADMINISTRATOR. No channel-specific management role is created. A public channel may be joined by any workspace member; private-channel participation is managed by the workspace OWNER or ADMINISTRATOR.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateChannelRequest' }
+      responses:
+        '201':
+          description: Channel created.
+          headers:
+            Location: { $ref: '#/components/headers/Location' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Channel' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+    get:
+      tags: [Channels]
+      operationId: listChannels
+      summary: Public channels and private channels I can access (FR-008, FR-010)
+      parameters:
+        - name: visibility
+          in: query
+          schema: { $ref: '#/components/schemas/ChannelVisibility' }
+        - name: archived
+          in: query
+          schema: { type: boolean }
+        - name: joined
+          in: query
+          schema: { type: boolean }
+        - $ref: '#/components/parameters/Q'
+        - $ref: '#/components/parameters/Offset'
+        - $ref: '#/components/parameters/Limit'
+        - name: sort
+          in: query
+          description: 'Sortable: name, createdAtUtc. Default: name.'
+          schema: { type: string, default: name }
+      responses:
+        '200':
+          description: Page of channels.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ChannelPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /channels/{channelId}:
+    parameters:
+      - $ref: '#/components/parameters/ChannelId'
+    get:
+      tags: [Channels]
+      operationId: getChannel
+      summary: Channel details
+      responses:
+        '200':
+          description: Channel.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Channel' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Channels]
+      operationId: updateChannel
+      summary: Owner/Administrator renames or archives a channel (FR-009, FR-019)
+      description: Requires workspace OWNER or ADMINISTRATOR. Archiving is permanent in V1; archived=false returns 422 UNARCHIVE_NOT_SUPPORTED. Renaming an archived channel returns 403 CHANNEL_ARCHIVED.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateChannelRequest' }
+      responses:
+        '200':
+          description: Updated channel.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Channel' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /channels/{channelId}/participants:
+    parameters:
+      - $ref: '#/components/parameters/ChannelId'
+    get:
+      tags: [Channels]
+      operationId: listChannelParticipants
+      summary: Channel participants
+      parameters:
+        - $ref: '#/components/parameters/Offset'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Page of participants.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ParticipantPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Channels]
+      operationId: addChannelParticipant
+      summary: Join a public channel or manage private-channel participants (FR-009, FR-010)
+      description: Any workspace user (OWNER, ADMINISTRATOR or MEMBER) may add only themselves to a PUBLIC channel. Only workspace OWNER or ADMINISTRATOR may add a workspace member to a PRIVATE channel. There is no independent channel-management permission.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [userId]
+              properties:
+                userId: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Already a participant (idempotent).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Participant' }
+        '201':
+          description: Participant added.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Participant' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /channels/{channelId}/participants/{userId}:
+    parameters:
+      - $ref: '#/components/parameters/ChannelId'
+      - $ref: '#/components/parameters/UserId'
+    delete:
+      tags: [Channels]
+      operationId: removeChannelParticipant
+      summary: Leave a channel or remove a private-channel participant (FR-010)
+      description: A channel participant may remove only themselves; only workspace OWNER or ADMINISTRATOR may remove someone else from a PRIVATE channel. There is no manager handoff or special channel-leaving restriction.
+      responses:
+        '204': { description: Removed; live subscriptions closed within 5 s. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  # ----------------------------------------------------------- Messaging (6.3)
+  /workspaces/{workspaceId}/conversations:
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceId'
+    get:
+      tags: [Messaging]
+      operationId: listMyConversations
+      summary: My conversations with unread state (FR-008, FR-021)
+      parameters:
+        - name: type
+          in: query
+          schema: { $ref: '#/components/schemas/ConversationType' }
+        - $ref: '#/components/parameters/Offset'
+        - $ref: '#/components/parameters/Limit'
+        - name: sort
+          in: query
+          description: 'Sortable: name, lastMessageAtUtc. Default: -lastMessageAtUtc.'
+          schema: { type: string, default: -lastMessageAtUtc }
+      responses:
+        '200':
+          description: Page of conversations.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConversationPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Messaging]
+      operationId: createConversation
+      summary: Create a direct (2) or group (3-20) conversation (FR-015)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateConversationRequest' }
+      responses:
+        '200':
+          description: A DIRECT conversation for this pair already exists; it is returned.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Conversation' }
+        '201':
+          description: Conversation created.
+          headers:
+            Location: { $ref: '#/components/headers/Location' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Conversation' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /conversations/{conversationId}:
+    parameters:
+      - $ref: '#/components/parameters/ConversationId'
+    get:
+      tags: [Messaging]
+      operationId: getConversation
+      summary: Conversation details and participants
+      responses:
+        '200':
+          description: Conversation.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Conversation' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /conversations/{conversationId}/messages:
+    parameters:
+      - $ref: '#/components/parameters/ConversationId'
+    get:
+      tags: [Messaging]
+      operationId: getMessageHistory
+      summary: Message history ordered by seq (FR-013)
+      description: |
+        Returns messages in ascending `seq` order. Without `beforeSeq`/`afterSeq` the newest page is returned.
+        `beforeSeq` and `afterSeq` cannot be combined (400). Use `thread=all` for reconnect catch-up so that
+        the seq sequence has no gaps.
+      parameters:
+        - name: beforeSeq
+          in: query
+          schema: { type: integer, format: int64, minimum: 1 }
+        - name: afterSeq
+          in: query
+          schema: { type: integer, format: int64, minimum: 0 }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+        - name: thread
+          in: query
+          schema: { type: string, enum: [top, all], default: top }
+      responses:
+        '200':
+          description: Page of messages.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MessageSlice' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      tags: [Messaging]
+      operationId: sendMessage
+      summary: Send a message or thread reply (FR-011, FR-014, FR-017, FR-024)
+      description: |
+        Idempotent on (conversationId, clientRequestId): a repeated request returns 200 with the original
+        message and publishes no new event. The response is sent only after the message is committed (NFR-005).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SendMessageRequest' }
+            example:
+              clientRequestId: 3f1c9a4e-2b7d-4c1e-9f0a-6d5b8e2c1a77
+              text: 'Draft is ready <@0c4a1b3e-7f2d-4e8a-9b6c-1d2e3f4a5b6c>'
+              attachmentIds: []
+      responses:
+        '200':
+          description: Replay of an already accepted clientRequestId.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Message' }
+        '201':
+          description: Message accepted and stored.
+          headers:
+            Location: { $ref: '#/components/headers/Location' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Message' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /messages/{messageId}:
+    parameters:
+      - $ref: '#/components/parameters/MessageId'
+    get:
+      tags: [Messaging]
+      operationId: getMessage
+      summary: Single message
+      responses:
+        '200':
+          description: Message.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Message' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Messaging]
+      operationId: editMessage
+      summary: Edit own message (FR-016, SHOULD)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [text, expectedEditVersion]
+              properties:
+                text: { type: string, minLength: 1, maxLength: 4000 }
+                expectedEditVersion:
+                  type: integer
+                  minimum: 0
+                  description: editVersion the client is editing; mismatch returns 409 EDIT_CONFLICT.
+      responses:
+        '200':
+          description: Updated message.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Message' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+    delete:
+      tags: [Messaging]
+      operationId: deleteMessage
+      summary: Delete a message, leaving a tombstone (FR-016, FR-019)
+      description: Author, or Administrator/Owner for moderation. Moderation deletes write an audit record (actor, action, messageId, reason, time).
+      parameters:
+        - name: reason
+          in: query
+          required: false
+          schema: { type: string, maxLength: 200 }
+      responses:
+        '204': { description: Deleted. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /messages/{messageId}/replies:
+    parameters:
+      - $ref: '#/components/parameters/MessageId'
+    get:
+      tags: [Messaging]
+      operationId: getThreadReplies
+      summary: Thread replies ordered by seq (FR-017, SHOULD)
+      parameters:
+        - name: afterSeq
+          in: query
+          schema: { type: integer, format: int64, minimum: 0 }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+      responses:
+        '200':
+          description: Replies.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MessageSlice' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /messages/{messageId}/reactions/{emoji}:
+    parameters:
+      - $ref: '#/components/parameters/MessageId'
+      - name: emoji
+        in: path
+        required: true
+        description: Emoji shortcode from the supported list (reference data).
+        schema: { type: string, pattern: '^[a-z0-9_+-]{1,32}$', example: thumbs_up }
+    put:
+      tags: [Messaging]
+      operationId: addReaction
+      summary: Add my reaction (idempotent, FR-018, SHOULD)
+      responses:
+        '200':
+          description: Reaction summary of the message.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ReactionSummary' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+    delete:
+      tags: [Messaging]
+      operationId: removeReaction
+      summary: Remove my reaction (idempotent)
+      responses:
+        '204': { description: Removed or was not present. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /conversations/{conversationId}/read-cursor:
+    parameters:
+      - $ref: '#/components/parameters/ConversationId'
+    put:
+      tags: [Messaging]
+      operationId: setReadCursor
+      summary: Set my last-read position (FR-021)
+      description: Monotonic - a value lower than the stored one is ignored and the stored value is returned. Values above latestSeq return 422.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [lastReadSeq]
+              properties:
+                lastReadSeq: { type: integer, format: int64, minimum: 0 }
+      responses:
+        '200':
+          description: Current read state.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReadState' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  # ------------------------------------------------------------ Presence (6.3)
+  /workspaces/{workspaceId}/presence:
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceId'
+    get:
+      tags: [Presence]
+      operationId: getWorkspacePresence
+      summary: Online status of all workspace members (FR-020)
+      responses:
+        '200':
+          description: Presence list.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Presence' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ----------------------------------------------------------- Documents (6.4)
+  /channels/{channelId}/documents:
+    parameters:
+      - $ref: '#/components/parameters/ChannelId'
+    post:
+      tags: [Documents]
+      operationId: createDocument
+      summary: Create a shared document in a channel (FR-027)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [title]
+              properties:
+                title: { type: string, minLength: 1, maxLength: 100 }
+      responses:
+        '201':
+          description: Document created with empty content.
+          headers:
+            Location: { $ref: '#/components/headers/Location' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Document' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+    get:
+      tags: [Documents]
+      operationId: listChannelDocuments
+      summary: Documents of a channel (FR-027)
+      parameters:
+        - $ref: '#/components/parameters/Q'
+        - $ref: '#/components/parameters/Offset'
+        - $ref: '#/components/parameters/Limit'
+        - name: sort
+          in: query
+          description: 'Sortable: title, updatedAtUtc. Default: -updatedAtUtc.'
+          schema: { type: string, default: -updatedAtUtc }
+      responses:
+        '200':
+          description: Page of documents.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DocumentPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /documents/{documentId}:
+    parameters:
+      - $ref: '#/components/parameters/DocumentId'
+    get:
+      tags: [Documents]
+      operationId: getDocument
+      summary: Document metadata and active editors
+      responses:
+        '200':
+          description: Document.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Document' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Documents]
+      operationId: renameDocument
+      summary: Rename a document (FR-038, SHOULD)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [title]
+              properties:
+                title: { type: string, minLength: 1, maxLength: 100 }
+      responses:
+        '200':
+          description: Updated document.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Document' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+    delete:
+      tags: [Documents]
+      operationId: deleteDocument
+      summary: Delete a document; open sessions are closed with 4004 (FR-038, SHOULD)
+      responses:
+        '204': { description: Deleted. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /documents/{documentId}/content:
+    parameters:
+      - $ref: '#/components/parameters/DocumentId'
+    get:
+      tags: [Documents]
+      operationId: getDocumentText
+      summary: Current document text as plain text (read-only export)
+      responses:
+        '200':
+          description: Current text.
+          headers:
+            X-Document-Seq:
+              description: lastUpdateSeq included in this text.
+              schema: { type: integer, format: int64 }
+          content:
+            text/plain:
+              schema: { type: string, maxLength: 100000 }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # --------------------------------------------------------------- Files (6.5)
+  /workspaces/{workspaceId}/files:
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceId'
+    post:
+      tags: [Files]
+      operationId: uploadFile
+      summary: Upload an attachment (FR-024, FR-026)
+      description: PNG, JPEG, PDF or TXT detected from content, max 10 MiB. Idempotent on (uploader, clientRequestId).
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file, conversationId, clientRequestId]
+              properties:
+                file: { type: string, format: binary }
+                conversationId: { type: string, format: uuid }
+                clientRequestId: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Replay of an earlier upload with the same clientRequestId.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FileMetadata' }
+        '201':
+          description: File stored (status READY).
+          headers:
+            Location: { $ref: '#/components/headers/Location' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FileMetadata' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /files/{fileId}:
+    parameters:
+      - $ref: '#/components/parameters/FileId'
+    get:
+      tags: [Files]
+      operationId: getFileMetadata
+      summary: Attachment metadata (FR-026)
+      responses:
+        '200':
+          description: Metadata.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FileMetadata' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Files]
+      operationId: cancelUpload
+      summary: Cancel an upload not yet attached to a message
+      responses:
+        '204': { description: Deleted. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /files/{fileId}/content:
+    parameters:
+      - $ref: '#/components/parameters/FileId'
+    get:
+      tags: [Files]
+      operationId: downloadFile
+      summary: Download an attachment; access is re-checked on every call (FR-025)
+      responses:
+        '200':
+          description: File bytes.
+          headers:
+            Content-Disposition:
+              description: inline for PNG/JPEG, attachment otherwise.
+              schema: { type: string }
+            X-Content-Type-Options:
+              schema: { type: string, enum: [nosniff] }
+            Cache-Control:
+              schema: { type: string, enum: ['private, no-store'] }
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  # -------------------------------------------------------------- Search (6.5)
+  /workspaces/{workspaceId}/search/messages:
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceId'
+    get:
+      tags: [Search]
+      operationId: searchMessages
+      summary: Search message text the caller may read (FR-022, SHOULD)
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema: { type: string, minLength: 2, maxLength: 200 }
+        - name: conversationId
+          in: query
+          schema: { type: string, format: uuid }
+        - name: senderId
+          in: query
+          schema: { type: string, format: uuid }
+        - name: fromUtc
+          in: query
+          schema: { type: string, format: date-time }
+        - name: toUtc
+          in: query
+          schema: { type: string, format: date-time }
+        - $ref: '#/components/parameters/Offset'
+        - $ref: '#/components/parameters/Limit'
+        - name: sort
+          in: query
+          schema: { type: string, enum: [relevance, -createdAtUtc], default: relevance }
+      responses:
+        '200':
+          description: Page of hits.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SearchHitPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  # ------------------------------------------------------- Notifications (6.5)
+  /notifications:
+    get:
+      tags: [Notifications]
+      operationId: listNotifications
+      summary: My in-app notifications (FR-023, SHOULD)
+      parameters:
+        - name: workspaceId
+          in: query
+          schema: { type: string, format: uuid }
+        - name: read
+          in: query
+          schema: { type: boolean }
+        - $ref: '#/components/parameters/Offset'
+        - $ref: '#/components/parameters/Limit'
+        - name: sort
+          in: query
+          schema: { type: string, enum: [-createdAtUtc, createdAtUtc], default: -createdAtUtc }
+      responses:
+        '200':
+          description: Page of notifications.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NotificationPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    patch:
+      tags: [Notifications]
+      operationId: markAllNotificationsRead
+      summary: Mark all my notifications in a workspace as read
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [read, workspaceId]
+              properties:
+                read: { type: boolean, enum: [true] }
+                workspaceId: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Number of notifications changed.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [updated]
+                properties:
+                  updated: { type: integer, minimum: 0 }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /notifications/{notificationId}:
+    parameters:
+      - name: notificationId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    patch:
+      tags: [Notifications]
+      operationId: markNotificationRead
+      summary: Mark one notification as read
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [read]
+              properties:
+                read: { type: boolean, enum: [true] }
+      responses:
+        '200':
+          description: Updated notification.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Notification' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ------------------------------------------------- WebSocket - Messaging (6.3)
+  /ws:
+    get:
+      tags: [WebSocket - Messaging]
+      operationId: openMessagingSocket
+      summary: Open the live messaging WebSocket (FR-012, FR-020, FR-021)
+      description: |
+        One socket per client (`wss://<host>/api/v1/ws`), authenticated by the session cookie at upgrade; the gateway
+        also checks `Origin`. Any healthy Messaging instance may serve it (no sticky sessions).
+        Every frame is a `WsFrame` JSON text frame.
+
+        | Dir | type | Payload schema | Behaviour |
+        |---|---|---|---|
+        | S→C | `session.ready` | WsSessionReady | First frame after connecting |
+        | C→S | `workspace.select` | WsWorkspaceSelect | Subscribe to all my conversations in the workspace; replaces the previous selection |
+        | S→C | `workspace.selected` | WsWorkspaceSelect | Confirmation; client then runs catch-up |
+        | C→S | `heartbeat` | `{}` | Every 10 s; refreshes presence TTL 15 s |
+        | S→C | `heartbeat.ack` | WsHeartbeatAck | Reply |
+        | S→C | `message.created` | Message | New message, reply or document card |
+        | S→C | `message.updated` | Message | Apply only if `editVersion` higher |
+        | S→C | `message.deleted` | WsMessageDeleted | Show tombstone |
+        | S→C | `reaction.changed` | WsReactionChanged | Summary as seen by receiver |
+        | S→C | `read-cursor.updated` | ReadState | Sent to my other sessions |
+        | S→C | `conversation.created` | Conversation | Added to DM/group or joined channel |
+        | S→C | `channel.updated` | WsChannelUpdated | Rename/archive; archive → read-only |
+        | S→C | `presence.changed` | Presence | Member online/offline |
+        | S→C | `notification.created` | Notification | DM or mention |
+        | S→C | `access.revoked` | WsAccessRevoked | Remove content from view |
+        | S→C | `resync.required` | WsResyncRequired | Run catch-up |
+        | S→C | `error` | WsError | Rejected client frame |
+
+        **Delivery and catch-up:** pushes are best effort (at most once per connection); REST history is complete.
+        Client keeps the highest contiguous `seq` per conversation: `seq = last+1` → show; higher → buffer and
+        `GET /conversations/{id}/messages?afterSeq=<last>&thread=all`; known → ignore.
+        After (re)connect and `workspace.selected`: `GET /workspaces/{id}/conversations` and fetch `afterSeq` where
+        `latestSeq` is higher. Unacknowledged sends are retried with the same `clientRequestId`.
+
+        **Reconnect:** 0.5, 1, 2, 4, then every 8 s, each ±20 % jitter (stays within 15 s, NFR-004).
+        Server closes a socket with no heartbeat for 30 s.
+
+        **Close codes:** 1000 normal (no reconnect) · 1001/1012 instance restart (reconnect immediately) ·
+        4001 session invalid (go to sign-in) · 4003 workspace access revoked (select another) ·
+        4008 heartbeat timeout (backoff) · 4029 more than 20 frames/s (reconnect after 10 s).
+      parameters:
+        - $ref: '#/components/parameters/UpgradeHeader'
+        - $ref: '#/components/parameters/ConnectionHeader'
+        - $ref: '#/components/parameters/OriginHeader'
+      responses:
+        '101':
+          description: Switching Protocols; frames follow the WsFrame schema.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WsFrame' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ------------------------------------------------- WebSocket - Documents (6.4)
+  /ws/documents/{documentId}:
+    parameters:
+      - $ref: '#/components/parameters/DocumentId'
+    get:
+      tags: [WebSocket - Documents]
+      operationId: openDocumentSocket
+      summary: Open the document sync WebSocket (FR-029 - FR-035)
+      description: |
+        Opened when a document is opened. The Collaboration instance checks the session and channel read access at
+        upgrade; on failure it accepts and immediately closes with 4003/4004 so the client sees the reason.
+        Document = one `Y.Doc` with one root `Y.Text` named `content`. Frames are `WsFrame` JSON text frames, max 1 MiB;
+        Yjs state vectors and updates are standard base64.
+
+        | Dir | type | Payload schema | Behaviour |
+        |---|---|---|---|
+        | C→S | `sync.request` | WsSyncRequest | First frame, and whenever updates may be missing |
+        | S→C | `sync.response` | WsSyncResponse | Missing server state; client applies it and retries preserved pending updates with their original `updateId` |
+        | C→S | `update` | WsDocUpdate | Local edit; at most one per 50 ms |
+        | S→C | `update.ack` | WsUpdateAck | Only after commit + outbox (NFR-005) |
+        | S→C | `update.rejected` | WsUpdateRejected | READ_ONLY, DOCUMENT_TOO_LARGE, MALFORMED_UPDATE, ACCESS_REVOKED |
+        | S→C | `update.remote` | WsUpdateRemote | Another editor's committed update |
+        | C→S | `awareness` | WsAwareness | Caret/selection, ≤ every 100 ms, ≥ every 10 s |
+        | S→C | `participants` | WsParticipants | Full editor list on join/leave/expiry |
+        | S→C | `awareness.remote` | WsAwarenessRemote | One editor's caret moved |
+        | S→C | `document.renamed` | WsDocumentRenamed | Title changed |
+        | S→C | `access.changed` | WsAccessChanged | Read-only switch |
+        | S→C | `error` | WsError | Malformed frame |
+
+        **Server validation of each update (FR-035):** (1) write access and channel not archived; (2) valid Yjs update
+        touching only `content`; (3) text ≤ 100,000 characters after applying to a copy; (4) store bytes with new
+        per-document `seq` + `updateId` + outbox in one transaction (unique (documentId, updateId)); (5) apply to room,
+        `update.ack` to sender, `update.remote` to local editors, other instances via `document.updated`.
+        Server sets `userId`, `displayName`, `color` (8 fixed colours by join order) — never trusted from client.
+
+        **Client rules:** keep unacknowledged updates pending and show "Saved" / "Saving…" / "Offline – changes not saved".
+        No ack in 5 s while connected → resend same `updateId`. After reconnect: `sync.request`, apply the server
+        response, then retry each preserved pending update with its original `updateId` (idempotent even if committed).
+        If local edits have no preserved update frame, send one Yjs state-vector diff with a new `updateId` instead;
+        never submit both forms for the same pending edit. On DOCUMENT_TOO_LARGE /
+        MALFORMED_UPDATE: show rejected text as unsent, discard local `Y.Doc`, resync from empty. Gap in `update.remote`
+        `seq` → `sync.request`. Editor without awareness/heartbeat for 15 s is removed (FR-034).
+
+        **Close codes:** 1001/1012 restart (reconnect immediately) · 4001 session invalid · 4003 no access / revoked ·
+        4004 document not found or deleted (do not reconnect) · 4008 heartbeat timeout · 4029 rate limit.
+        Backoff as for `/ws`.
+      parameters:
+        - $ref: '#/components/parameters/UpgradeHeader'
+        - $ref: '#/components/parameters/ConnectionHeader'
+        - $ref: '#/components/parameters/OriginHeader'
+      responses:
+        '101':
+          description: Switching Protocols; frames follow the WsFrame schema.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WsFrame' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ------------------------------------------------------------ Internal (6.6)
+  /internal/v1/sessions/validate:
+    servers:
+      - url: http://auth-service:8080
+    post:
+      tags: [Internal]
+      operationId: internalValidateSession
+      summary: Validate a session token (gateway, every request and upgrade)
+      security:
+        - internalToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token: { type: string }
+      responses:
+        '200':
+          description: Validation result.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [valid]
+                properties:
+                  valid: { type: boolean }
+                  userId: { type: string, format: uuid }
+                  sessionId: { type: string, format: uuid }
+                  expiresAtUtc: { type: string, format: date-time }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /internal/v1/access:
+    servers:
+      - url: http://workspace-service:8080
+    get:
+      tags: [Internal]
+      operationId: internalCheckAccess
+      summary: Permission check used by all services (fail closed on error)
+      security:
+        - internalToken: []
+      parameters:
+        - { name: userId, in: query, required: true, schema: { type: string, format: uuid } }
+        - { name: workspaceId, in: query, required: true, schema: { type: string, format: uuid } }
+        - { name: channelId, in: query, required: false, schema: { type: string, format: uuid } }
+        - name: action
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [workspace.read, workspace.manage-members, workspace.manage-administrators, workspace.transfer-ownership, channel.read, channel.write, channel.manage, message.moderate]
+          description: workspace.manage-members is available to OWNER/ADMINISTRATOR for invitations and MEMBER removals; workspace.manage-administrators and workspace.transfer-ownership are OWNER-only. channel.manage is permitted only to OWNER/ADMINISTRATOR; public channel self-join is handled separately.
+      responses:
+        '200':
+          description: Decision.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [allowed]
+                properties:
+                  allowed: { type: boolean }
+                  workspaceRole: { $ref: '#/components/schemas/WorkspaceRole' }
+                  channelArchived: { type: boolean }
+
+  /internal/v1/workspaces/{workspaceId}/users/{userId}/channel-ids:
+    servers:
+      - url: http://workspace-service:8080
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceId'
+      - $ref: '#/components/parameters/UserId'
+    get:
+      tags: [Internal]
+      operationId: internalAccessibleChannelIds
+      summary: Channel IDs the user can read (Search)
+      security:
+        - internalToken: []
+      responses:
+        '200':
+          description: IDs.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [channelIds]
+                properties:
+                  channelIds:
+                    type: array
+                    items: { type: string, format: uuid }
+
+  /internal/v1/conversations/{conversationId}/access:
+    servers:
+      - url: http://messaging-service:8080
+    parameters:
+      - $ref: '#/components/parameters/ConversationId'
+    get:
+      tags: [Internal]
+      operationId: internalConversationAccess
+      summary: Can the user read/write this conversation (File, Collaboration); delegates to Workspace for channels
+      security:
+        - internalToken: []
+      parameters:
+        - { name: userId, in: query, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Decision.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [canRead, canWrite]
+                properties:
+                  canRead: { type: boolean }
+                  canWrite: { type: boolean }
+
+  /internal/v1/workspaces/{workspaceId}/users/{userId}/conversation-ids:
+    servers:
+      - url: http://messaging-service:8080
+    parameters:
+      - $ref: '#/components/parameters/WorkspaceId'
+      - $ref: '#/components/parameters/UserId'
+    get:
+      tags: [Internal]
+      operationId: internalDirectConversationIds
+      summary: DIRECT/GROUP conversation IDs of the user (Search)
+      security:
+        - internalToken: []
+      responses:
+        '200':
+          description: IDs.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [conversationIds]
+                properties:
+                  conversationIds:
+                    type: array
+                    items: { type: string, format: uuid }
+
+  /internal/v1/files/{fileId}:
+    servers:
+      - url: http://file-service:8080
+    parameters:
+      - $ref: '#/components/parameters/FileId'
+    get:
+      tags: [Internal]
+      operationId: internalGetFile
+      summary: File status for attaching (Messaging)
+      security:
+        - internalToken: []
+      responses:
+        '200':
+          description: File info.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, uploaderId, conversationId, name, mimeType, sizeBytes]
+                properties:
+                  status: { type: string, enum: [UPLOADING, READY, FAILED] }
+                  uploaderId: { type: string, format: uuid }
+                  conversationId: { type: string, format: uuid }
+                  name: { type: string }
+                  mimeType: { type: string }
+                  sizeBytes: { type: integer }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /internal/v1/sessions/{sessionId}/heartbeat:
+    servers:
+      - url: http://presence-service:8080
+    parameters:
+      - name: sessionId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    put:
+      tags: [Internal]
+      operationId: internalHeartbeat
+      summary: Refresh presence of a session (TTL 15 s) - called by Messaging on each WebSocket heartbeat
+      security:
+        - internalToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [userId]
+              properties:
+                userId: { type: string, format: uuid }
+      responses:
+        '204': { description: Refreshed. }
+    delete:
+      tags: [Internal]
+      operationId: internalSessionDisconnected
+      summary: Session socket closed - remove its presence entry
+      security:
+        - internalToken: []
+      responses:
+        '204': { description: Removed. }
+
+  # -------------------------------------------------------------- Health (6.6)
+  /health/live:
+    servers:
+      - url: 'http://{service}:8080'
+        variables:
+          service:
+            default: auth-service
+            enum: [auth-service, workspace-service, messaging-service, collaboration-service, presence-service, file-service, search-service, notification-service]
+    get:
+      tags: [Health]
+      operationId: healthLive
+      summary: 200 while the process runs
+      security: []
+      responses:
+        '200':
+          description: Alive.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Health' }
+
+  /health/ready:
+    servers:
+      - url: 'http://{service}:8080'
+        variables:
+          service:
+            default: auth-service
+            enum: [auth-service, workspace-service, messaging-service, collaboration-service, presence-service, file-service, search-service, notification-service]
+    get:
+      tags: [Health]
+      operationId: healthReady
+      summary: 200 only when database, broker and Redis connections work; used by Docker Compose and the gateway
+      security: []
+      responses:
+        '200':
+          description: Ready.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Health' }
+        '503':
+          description: Not ready.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Health' }
+
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: synq_session
+      description: |
+        Opaque session token (32 random bytes, base64url; only its SHA-256 hash is stored). Cookie attributes
+        `HttpOnly; Secure; SameSite=Strict; Path=/api` (`Secure` omitted only for local http://localhost).
+        Expires after 24 h without requests or 7 days after sign-in. The gateway validates it on every request and
+        WebSocket upgrade via the Auth Service (Redis-cached; sign-out deletes the cache entry before responding),
+        then forwards `X-User-Id` / `X-Session-Id` and strips client-sent copies of those headers.
+    internalToken:
+      type: apiKey
+      in: header
+      name: X-Internal-Token
+      description: Shared secret from configuration, required on all /internal endpoints.
+
+  headers:
+    Location:
+      description: URL of the created resource.
+      schema: { type: string }
+    SetSessionCookie:
+      description: '`synq_session=<token>; HttpOnly; Secure; SameSite=Strict; Path=/api`'
+      schema: { type: string }
+    RetryAfter:
+      description: Seconds to wait before retrying.
+      schema: { type: integer, minimum: 1 }
+
+  parameters:
+    WorkspaceId:
+      name: workspaceId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    ChannelId:
+      name: channelId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    ConversationId:
+      name: conversationId
+      in: path
+      required: true
+      description: For channel conversations this equals the channelId.
+      schema: { type: string, format: uuid }
+    MessageId:
+      name: messageId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    DocumentId:
+      name: documentId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    FileId:
+      name: fileId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    UserId:
+      name: userId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    Offset:
+      name: offset
+      in: query
+      schema: { type: integer, minimum: 0, default: 0 }
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+    UpgradeHeader:
+      name: Upgrade
+      in: header
+      required: true
+      schema: { type: string, enum: [websocket] }
+    ConnectionHeader:
+      name: Connection
+      in: header
+      required: true
+      schema: { type: string, enum: [Upgrade] }
+    OriginHeader:
+      name: Origin
+      in: header
+      required: true
+      description: Must match the Synq host (cross-site WebSocket hijacking protection).
+      schema: { type: string }
+    Q:
+      name: q
+      in: query
+      description: Case-insensitive substring match on the name/title.
+      schema: { type: string, minLength: 1, maxLength: 100 }
+
+  responses:
+    BadRequest:
+      description: Malformed request (BAD_REQUEST).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unauthorized:
+      description: No valid session (AUTH_REQUIRED, SESSION_EXPIRED) or wrong credentials (INVALID_CREDENTIALS).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            code: SESSION_EXPIRED
+            message: Your session has expired. Please sign in again.
+            correlationId: 0b6f2c1e-6a43-4c55-9a51-5d7f0f0b2a10
+    Forbidden:
+      description: Signed in but not allowed (FORBIDDEN, CHANNEL_ARCHIVED, INVITATION_EMAIL_MISMATCH).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            code: CHANNEL_ARCHIVED
+            message: This channel is archived and is read-only.
+            correlationId: 0b6f2c1e-6a43-4c55-9a51-5d7f0f0b2a10
+    NotFound:
+      description: Resource does not exist or was deleted (NOT_FOUND).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Conflict:
+      description: |
+        Uniqueness or state conflict: EMAIL_TAKEN, CHANNEL_NAME_TAKEN, ALREADY_MEMBER, INVITATION_USED,
+        INVITATION_EXPIRED, INVITATION_REVOKED, OWNER_MUST_TRANSFER, EDIT_CONFLICT,
+        FILE_NOT_READY, FILE_ATTACHED.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    PayloadTooLarge:
+      description: Body or file above the limit (PAYLOAD_TOO_LARGE, FILE_TOO_LARGE).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    UnsupportedMediaType:
+      description: File type not allowed (UNSUPPORTED_MEDIA_TYPE).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ValidationFailed:
+      description: |
+        Field validation failed (VALIDATION_FAILED with fieldErrors) or a rule-specific code:
+        NOT_A_MEMBER, ATTACHMENT_NOT_READY, UNKNOWN_EMOJI, USE_OWNERSHIP_TRANSFER, UNARCHIVE_NOT_SUPPORTED.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            code: VALIDATION_FAILED
+            message: Some fields are invalid.
+            correlationId: 0b6f2c1e-6a43-4c55-9a51-5d7f0f0b2a10
+            fieldErrors:
+              - { field: text, code: TOO_LONG, message: At most 4000 characters. }
+    TooManyRequests:
+      description: Rate limit exceeded (RATE_LIMITED).
+      headers:
+        Retry-After: { $ref: '#/components/headers/RetryAfter' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ServiceUnavailable:
+      description: A required service, database or broker is unavailable (DEPENDENCY_UNAVAILABLE).
+      headers:
+        Retry-After: { $ref: '#/components/headers/RetryAfter' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    # ---------------------------------------------------------------- common
+    Error:
+      type: object
+      required: [code, message, correlationId]
+      properties:
+        code:
+          type: string
+          description: Stable error code from the catalogue in Section 6.6; also the key into client language files.
+          example: CHANNEL_ARCHIVED
+        message:
+          type: string
+          description: Default English text, safe to show to the user.
+        description:
+          type: string
+          description: Optional longer explanation.
+        correlationId: { type: string, format: uuid }
+        fieldErrors:
+          type: array
+          description: Present only on 422 VALIDATION_FAILED.
+          items: { $ref: '#/components/schemas/FieldError' }
+    FieldError:
+      type: object
+      required: [field, code, message]
+      properties:
+        field: { type: string, example: text }
+        code:
+          type: string
+          enum: [REQUIRED, TOO_SHORT, TOO_LONG, INVALID_FORMAT, OUT_OF_RANGE, NOT_ALLOWED]
+        message: { type: string }
+    PageMeta:
+      type: object
+      required: [total, offset, limit]
+      properties:
+        total: { type: integer, minimum: 0 }
+        offset: { type: integer, minimum: 0 }
+        limit: { type: integer, minimum: 1, maximum: 100 }
+    UserRef:
+      type: object
+      required: [userId, displayName]
+      properties:
+        userId: { type: string, format: uuid }
+        displayName: { type: string }
+
+    # ------------------------------------------------------------------ auth
+    RegisterRequest:
+      type: object
+      required: [email, displayName, password]
+      properties:
+        email: { type: string, format: email, maxLength: 254 }
+        displayName: { type: string, minLength: 1, maxLength: 50 }
+        password: { type: string, format: password, minLength: 8, maxLength: 128, writeOnly: true }
+    SignInRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email, maxLength: 254 }
+        password: { type: string, format: password, maxLength: 128, writeOnly: true }
+    SessionInfo:
+      type: object
+      required: [sessionId, expiresAtUtc, user]
+      properties:
+        sessionId: { type: string, format: uuid }
+        expiresAtUtc:
+          type: string
+          format: date-time
+          description: Earlier of idle expiry (24 h) and absolute expiry (7 days).
+        user: { $ref: '#/components/schemas/OwnUser' }
+    PublicUser:
+      type: object
+      required: [id, displayName]
+      properties:
+        id: { type: string, format: uuid }
+        displayName: { type: string, minLength: 1, maxLength: 50 }
+        avatarUrl:
+          type: string
+          nullable: true
+          description: Relative URL of the profile image, e.g. /api/v1/users/{id}/avatar?v=3. Null when no image.
+    OwnUser:
+      allOf:
+        - $ref: '#/components/schemas/PublicUser'
+        - type: object
+          required: [email, createdAtUtc]
+          properties:
+            email: { type: string, format: email }
+            createdAtUtc: { type: string, format: date-time }
+    UpdateProfileRequest:
+      type: object
+      required: [displayName]
+      properties:
+        displayName: { type: string, minLength: 1, maxLength: 50 }
+
+    # ------------------------------------------------------------ workspaces
+    WorkspaceRole:
+      type: string
+      enum: [OWNER, ADMINISTRATOR, MEMBER]
+    CreateWorkspaceRequest:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, minLength: 2, maxLength: 64 }
+    Workspace:
+      type: object
+      required: [id, name, ownerUserId, myRole, memberCount, createdAtUtc]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string, minLength: 2, maxLength: 64 }
+        ownerUserId: { type: string, format: uuid }
+        myRole: { $ref: '#/components/schemas/WorkspaceRole' }
+        memberCount: { type: integer, minimum: 1 }
+        createdAtUtc: { type: string, format: date-time }
+    WorkspacePage:
+      allOf:
+        - $ref: '#/components/schemas/PageMeta'
+        - type: object
+          required: [items]
+          properties:
+            items:
+              type: array
+              items: { $ref: '#/components/schemas/Workspace' }
+    Member:
+      type: object
+      required: [userId, displayName, role, joinedAtUtc]
+      properties:
+        userId: { type: string, format: uuid }
+        displayName: { type: string }
+        avatarUrl: { type: string, nullable: true }
+        email:
+          type: string
+          format: email
+          description: Only returned to Owner and Administrators.
+        role: { $ref: '#/components/schemas/WorkspaceRole' }
+        joinedAtUtc: { type: string, format: date-time }
+    MemberPage:
+      allOf:
+        - $ref: '#/components/schemas/PageMeta'
+        - type: object
+          required: [items]
+          properties:
+            items:
+              type: array
+              items: { $ref: '#/components/schemas/Member' }
+    JoinWorkspaceRequest:
+      type: object
+      description: Exactly one of the two fields.
+      properties:
+        invitationToken: { type: string, pattern: '^[A-Za-z0-9_-]{43}$' }
+        invitationId: { type: string, format: uuid }
+    ChangeRoleRequest:
+      type: object
+      required: [role]
+      properties:
+        role:
+          type: string
+          enum: [ADMINISTRATOR, MEMBER]
+          description: OWNER is not accepted; use ownership-transfers (422 USE_OWNERSHIP_TRANSFER).
+    InvitationStatus:
+      type: string
+      enum: [PENDING, USED, EXPIRED, REVOKED]
+    Invitation:
+      type: object
+      required: [id, workspaceId, workspaceName, email, invitedBy, status, createdAtUtc, expiresAtUtc]
+      properties:
+        id: { type: string, format: uuid }
+        workspaceId: { type: string, format: uuid }
+        workspaceName: { type: string }
+        email: { type: string, format: email }
+        invitedBy: { $ref: '#/components/schemas/UserRef' }
+        status: { $ref: '#/components/schemas/InvitationStatus' }
+        createdAtUtc: { type: string, format: date-time }
+        expiresAtUtc:
+          type: string
+          format: date-time
+          description: createdAtUtc + 7 days.
+    CreatedInvitation:
+      allOf:
+        - $ref: '#/components/schemas/Invitation'
+        - type: object
+          required: [link]
+          properties:
+            link:
+              type: string
+              description: Shown only in this response. Format https://<host>/invite/{token}.
+              example: https://synq.example.com/invite/q3Vh2kP0yXbG7dN8sL1mR4tW9zA6cE5fJ_uI-oKpQ2s
+    InvitationPage:
+      allOf:
+        - $ref: '#/components/schemas/PageMeta'
+        - type: object
+          required: [items]
+          properties:
+            items:
+              type: array
+              items: { $ref: '#/components/schemas/Invitation' }
+    InvitationPreview:
+      type: object
+      required: [workspaceId, workspaceName, inviterDisplayName, maskedEmail, status, expiresAtUtc]
+      properties:
+        workspaceId: { type: string, format: uuid }
+        workspaceName: { type: string }
+        inviterDisplayName: { type: string }
+        maskedEmail: { type: string, example: 'j***@example.com' }
+        status: { $ref: '#/components/schemas/InvitationStatus' }
+        expiresAtUtc: { type: string, format: date-time }
+
+    # -------------------------------------------------------------- channels
+    ChannelVisibility:
+      type: string
+      enum: [PUBLIC, PRIVATE]
+    CreateChannelRequest:
+      type: object
+      required: [name, visibility]
+      properties:
+        name:
+          type: string
+          minLength: 2
+          maxLength: 50
+          description: Unique case-insensitively within the workspace, including archived channels.
+        visibility: { $ref: '#/components/schemas/ChannelVisibility' }
+    UpdateChannelRequest:
+      type: object
+      minProperties: 1
+      properties:
+        name: { type: string, minLength: 2, maxLength: 50 }
+        archived:
+          type: boolean
+          description: Only true is accepted.
+    ChannelAccess:
+      type: object
+      description: canManage is true only for the workspace OWNER or ADMINISTRATOR. It is not a channel-specific role.
+      required: [isParticipant, canRead, canWrite, canManage]
+      properties:
+        isParticipant: { type: boolean }
+        canRead: { type: boolean }
+        canWrite: { type: boolean }
+        canManage: { type: boolean }
+    Channel:
+      type: object
+      required: [id, workspaceId, name, visibility, archived, participantCount, createdAtUtc, myAccess]
+      properties:
+        id: { type: string, format: uuid }
+        workspaceId: { type: string, format: uuid }
+        name: { type: string }
+        visibility: { $ref: '#/components/schemas/ChannelVisibility' }
+        archived: { type: boolean }
+        archivedAtUtc: { type: string, format: date-time, nullable: true }
+        participantCount: { type: integer, minimum: 0 }
+        createdAtUtc: { type: string, format: date-time }
+        myAccess: { $ref: '#/components/schemas/ChannelAccess' }
+    ChannelPage:
+      allOf:
+        - $ref: '#/components/schemas/PageMeta'
+        - type: object
+          required: [items]
+          properties:
+            items:
+              type: array
+              items: { $ref: '#/components/schemas/Channel' }
+    Participant:
+      type: object
+      required: [userId, displayName, joinedAtUtc]
+      properties:
+        userId: { type: string, format: uuid }
+        displayName: { type: string }
+        avatarUrl: { type: string, nullable: true }
+        joinedAtUtc: { type: string, format: date-time }
+    ParticipantPage:
+      allOf:
+        - $ref: '#/components/schemas/PageMeta'
+        - type: object
+          required: [items]
+          properties:
+            items:
+              type: array
+              items: { $ref: '#/components/schemas/Participant' }
+
+    # ------------------------------------------------------------- messaging
+    ConversationType:
+      type: string
+      enum: [CHANNEL, DIRECT, GROUP]
+    CreateConversationRequest:
+      type: object
+      required: [participantUserIds]
+      properties:
+        participantUserIds:
+          type: array
+          description: Other participants (the caller is added automatically). 1 = DIRECT, 2-19 = GROUP.
+          minItems: 1
+          maxItems: 19
+          uniqueItems: true
+          items: { type: string, format: uuid }
+    Conversation:
+      type: object
+      required: [id, workspaceId, type, name, latestSeq, lastReadSeq, unreadCount, mentionCount, createdAtUtc]
+      properties:
+        id: { type: string, format: uuid }
+        workspaceId: { type: string, format: uuid }
+        type: { $ref: '#/components/schemas/ConversationType' }
+        name:
+          type: string
+          description: Channel name, or participant display names joined by ", " for DIRECT/GROUP.
+        channelId:
+          type: string
+          format: uuid
+          nullable: true
+          description: Equals id for CHANNEL conversations, null otherwise.
+        participants:
+          type: array
+          description: Included for DIRECT/GROUP and on GET /conversations/{id}.
+          items: { $ref: '#/components/schemas/UserRef' }
+        latestSeq: { type: integer, format: int64, minimum: 0 }
+        lastReadSeq: { type: integer, format: int64, minimum: 0 }
+        unreadCount: { type: integer, minimum: 0 }
+        mentionCount: { type: integer, minimum: 0 }
+        lastMessageAtUtc: { type: string, format: date-time, nullable: true }
+        archived: { type: boolean, description: Channel archived (CHANNEL only). }
+        createdAtUtc: { type: string, format: date-time }
+    ConversationPage:
+      allOf:
+        - $ref: '#/components/schemas/PageMeta'
+        - type: object
+          required: [items]
+          properties:
+            items:
+              type: array
+              items: { $ref: '#/components/schemas/Conversation' }
+    SendMessageRequest:
+      type: object
+      required: [clientRequestId, text]
+      properties:
+        clientRequestId:
+          type: string
+          format: uuid
+          description: Client-generated; reuse the same value on every retry of this message.
+        text:
+          type: string
+          maxLength: 4000
+          description: 1-4000 characters after trimming, or 0-4000 when attachmentIds is not empty. Mentions as <@userId>.
+        attachmentIds:
+          type: array
+          maxItems: 5
+          uniqueItems: true
+          items: { type: string, format: uuid }
+        parentMessageId:
+          type: string
+          format: uuid
+          nullable: true
+          description: Top-level message in the same conversation (thread reply).
+    MessageKind:
+      type: string
+      enum: [USER, DOCUMENT_CARD, SYSTEM]
+    Attachment:
+      type: object
+      required: [fileId, name, mimeType, sizeBytes]
+      properties:
+        fileId: { type: string, format: uuid }
+        name: { type: string }
+        mimeType: { type: string, enum: [image/png, image/jpeg, application/pdf, text/plain] }
+        sizeBytes: { type: integer, minimum: 1, maximum: 10485760 }
+    ReactionSummary:
+      type: object
+      required: [emoji, count, reactedByMe]
+      properties:
+        emoji: { type: string, example: thumbs_up }
+        count: { type: integer, minimum: 1 }
+        reactedByMe: { type: boolean }
+    Message:
+      type: object
+      required: [id, conversationId, seq, kind, sender, text, attachments, reactions, replyCount, createdAtUtc, editVersion, deleted]
+      properties:
+        id: { type: string, format: uuid }
+        conversationId: { type: string, format: uuid }
+        seq:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Position in the conversation; the only ordering key.
+        clientRequestId: { type: string, format: uuid, nullable: true, description: Null for DOCUMENT_CARD and SYSTEM. }
+        kind: { $ref: '#/components/schemas/MessageKind' }
+        sender: { $ref: '#/components/schemas/UserRef' }
+        text: { type: string, nullable: true, maxLength: 4000, description: Null when deleted. }
+        mentionedUserIds:
+          type: array
+          items: { type: string, format: uuid }
+        attachments:
+          type: array
+          items: { $ref: '#/components/schemas/Attachment' }
+        parentMessageId: { type: string, format: uuid, nullable: true }
+        replyCount: { type: integer, minimum: 0 }
+        lastReplyAtUtc: { type: string, format: date-time, nullable: true }
+        reactions:
+          type: array
+          items: { $ref: '#/components/schemas/ReactionSummary' }
+        documentId: { type: string, format: uuid, nullable: true, description: Set for DOCUMENT_CARD. }
+        createdAtUtc: { type: string, format: date-time }
+        editVersion: { type: integer, minimum: 0 }
+        editedAtUtc: { type: string, format: date-time, nullable: true }
+        deleted: { type: boolean }
+        deletedBy: { type: string, enum: [AUTHOR, MODERATOR], nullable: true }
+    MessageSlice:
+      type: object
+      required: [items, hasMore]
+      properties:
+        items:
+          type: array
+          description: Ascending by seq.
+          items: { $ref: '#/components/schemas/Message' }
+        hasMore:
+          type: boolean
+          description: More messages exist in the requested direction.
+    ReadState:
+      type: object
+      required: [conversationId, lastReadSeq, latestSeq, unreadCount]
+      properties:
+        conversationId: { type: string, format: uuid }
+        lastReadSeq: { type: integer, format: int64, minimum: 0 }
+        latestSeq: { type: integer, format: int64, minimum: 0 }
+        unreadCount: { type: integer, minimum: 0 }
+    Presence:
+      type: object
+      required: [userId, status]
+      properties:
+        userId: { type: string, format: uuid }
+        status: { type: string, enum: [ONLINE, OFFLINE] }
+        lastSeenAtUtc: { type: string, format: date-time, nullable: true }
+
+    # ------------------------------------------------------------- documents
+    ActiveEditor:
+      type: object
+      required: [userId, displayName, color]
+      properties:
+        userId: { type: string, format: uuid }
+        displayName: { type: string }
+        color: { type: string, pattern: '^#[0-9a-f]{6}$', example: '#3b82f6' }
+    Document:
+      type: object
+      required: [id, channelId, workspaceId, title, createdBy, createdAtUtc, updatedAtUtc, lastUpdateSeq, characterCount, readOnly, activeEditors]
+      properties:
+        id: { type: string, format: uuid }
+        channelId: { type: string, format: uuid }
+        workspaceId: { type: string, format: uuid }
+        title: { type: string, minLength: 1, maxLength: 100 }
+        createdBy: { $ref: '#/components/schemas/UserRef' }
+        createdAtUtc: { type: string, format: date-time }
+        updatedAtUtc: { type: string, format: date-time }
+        lastUpdateSeq: { type: integer, format: int64, minimum: 0 }
+        characterCount: { type: integer, minimum: 0, maximum: 100000 }
+        readOnly:
+          type: boolean
+          description: True when the caller has no write access or the channel is archived.
+        activeEditors:
+          type: array
+          items: { $ref: '#/components/schemas/ActiveEditor' }
+    DocumentPage:
+      allOf:
+        - $ref: '#/components/schemas/PageMeta'
+        - type: object
+          required: [items]
+          properties:
+            items:
+              type: array
+              items: { $ref: '#/components/schemas/Document' }
+
+    # ----------------------------------------------------------------- files
+    FileMetadata:
+      type: object
+      required: [id, workspaceId, conversationId, name, mimeType, sizeBytes, uploaderId, status, createdAtUtc]
+      properties:
+        id: { type: string, format: uuid }
+        workspaceId: { type: string, format: uuid }
+        conversationId: { type: string, format: uuid }
+        messageId: { type: string, format: uuid, nullable: true, description: Set once attached. }
+        name: { type: string, minLength: 1, maxLength: 255 }
+        mimeType: { type: string, enum: [image/png, image/jpeg, application/pdf, text/plain] }
+        sizeBytes: { type: integer, minimum: 1, maximum: 10485760 }
+        uploaderId: { type: string, format: uuid }
+        status: { type: string, enum: [UPLOADING, READY, FAILED] }
+        createdAtUtc: { type: string, format: date-time }
+
+    # ---------------------------------------------------------------- search
+    SearchHit:
+      type: object
+      required: [messageId, conversationId, conversationName, conversationType, seq, sender, snippet, highlights, createdAtUtc]
+      properties:
+        messageId: { type: string, format: uuid }
+        conversationId: { type: string, format: uuid }
+        conversationName: { type: string }
+        conversationType: { $ref: '#/components/schemas/ConversationType' }
+        seq: { type: integer, format: int64 }
+        sender: { $ref: '#/components/schemas/UserRef' }
+        snippet: { type: string, maxLength: 200 }
+        highlights:
+          type: array
+          items:
+            type: object
+            required: [start, length]
+            properties:
+              start: { type: integer, minimum: 0 }
+              length: { type: integer, minimum: 1 }
+        createdAtUtc: { type: string, format: date-time }
+    SearchHitPage:
+      allOf:
+        - $ref: '#/components/schemas/PageMeta'
+        - type: object
+          required: [items]
+          properties:
+            items:
+              type: array
+              items: { $ref: '#/components/schemas/SearchHit' }
+
+    # --------------------------------------------------------- notifications
+    Notification:
+      type: object
+      required: [id, type, workspaceId, conversationId, messageId, actor, preview, read, createdAtUtc]
+      properties:
+        id: { type: string, format: uuid }
+        type: { type: string, enum: [DIRECT_MESSAGE, MENTION] }
+        workspaceId: { type: string, format: uuid }
+        conversationId: { type: string, format: uuid }
+        messageId: { type: string, format: uuid }
+        actor: { $ref: '#/components/schemas/UserRef' }
+        preview: { type: string, maxLength: 100 }
+        read: { type: boolean }
+        createdAtUtc: { type: string, format: date-time }
+    NotificationPage:
+      allOf:
+        - $ref: '#/components/schemas/PageMeta'
+        - type: object
+          required: [items, unreadTotal]
+          properties:
+            items:
+              type: array
+              items: { $ref: '#/components/schemas/Notification' }
+            unreadTotal: { type: integer, minimum: 0 }
+
+    # ------------------------------------------------------------ health (6.6)
+    Health:
+      type: object
+      required: [status, checks]
+      properties:
+        status: { type: string, enum: [UP, DOWN] }
+        checks:
+          type: object
+          properties:
+            postgres: { type: string, enum: [UP, DOWN] }
+            rabbitmq: { type: string, enum: [UP, DOWN] }
+            redis: { type: string, enum: [UP, DOWN] }
+
+    # ------------------------------------------------- WebSocket frames (6.3, 6.4)
+    WsFrame:
+      type: object
+      description: Envelope of every WebSocket text frame in both protocols.
+      required: [type, payload]
+      properties:
+        type: { type: string, example: message.created }
+        id: { type: string, description: 'Optional client frame id; echoed in error frames as frameId.' }
+        payload: { type: object }
+        sentAtUtc: { type: string, format: date-time, description: Set on server frames. }
+    WsError:
+      type: object
+      required: [code, message]
+      properties:
+        code: { type: string }
+        message: { type: string }
+        frameId: { type: string, nullable: true }
+    WsSessionReady:
+      type: object
+      required: [sessionId, userId, heartbeatIntervalSec]
+      properties:
+        sessionId: { type: string, format: uuid }
+        userId: { type: string, format: uuid }
+        heartbeatIntervalSec: { type: integer, enum: [10] }
+    WsWorkspaceSelect:
+      type: object
+      required: [workspaceId]
+      properties:
+        workspaceId: { type: string, format: uuid }
+    WsHeartbeatAck:
+      type: object
+      required: [serverTimeUtc]
+      properties:
+        serverTimeUtc: { type: string, format: date-time }
+    WsMessageDeleted:
+      type: object
+      required: [conversationId, messageId, seq, deletedBy]
+      properties:
+        conversationId: { type: string, format: uuid }
+        messageId: { type: string, format: uuid }
+        seq: { type: integer, format: int64 }
+        deletedBy: { type: string, enum: [AUTHOR, MODERATOR] }
+    WsReactionChanged:
+      type: object
+      required: [conversationId, messageId, reactions]
+      properties:
+        conversationId: { type: string, format: uuid }
+        messageId: { type: string, format: uuid }
+        reactions:
+          type: array
+          items: { $ref: '#/components/schemas/ReactionSummary' }
+    WsChannelUpdated:
+      type: object
+      required: [channelId, name, archived]
+      properties:
+        channelId: { type: string, format: uuid }
+        name: { type: string }
+        archived: { type: boolean }
+    WsAccessRevoked:
+      type: object
+      required: [scope, id]
+      properties:
+        scope: { type: string, enum: [WORKSPACE, CHANNEL, CONVERSATION] }
+        id: { type: string, format: uuid }
+    WsResyncRequired:
+      type: object
+      properties:
+        conversationIds:
+          type: array
+          description: Empty or missing = all conversations.
+          items: { type: string, format: uuid }
+    WsSyncRequest:
+      type: object
+      required: [stateVector]
+      properties:
+        stateVector: { type: string, format: byte, description: Yjs state vector (base64). }
+    WsSyncResponse:
+      type: object
+      required: [update, stateVector, lastUpdateSeq, readOnly, maxCharacters]
+      properties:
+        update: { type: string, format: byte, description: 'Y.encodeStateAsUpdate(serverDoc, clientStateVector), base64.' }
+        stateVector: { type: string, format: byte, description: Server state vector (base64). }
+        lastUpdateSeq: { type: integer, format: int64 }
+        readOnly: { type: boolean }
+        maxCharacters: { type: integer, enum: [100000] }
+    WsDocUpdate:
+      type: object
+      required: [updateId, update]
+      properties:
+        updateId: { type: string, format: uuid }
+        update: { type: string, format: byte, description: Yjs update (base64). }
+    WsUpdateAck:
+      type: object
+      required: [updateId, seq, duplicate]
+      properties:
+        updateId: { type: string, format: uuid }
+        seq: { type: integer, format: int64 }
+        duplicate: { type: boolean }
+    WsUpdateRejected:
+      type: object
+      required: [updateId, code, message]
+      properties:
+        updateId: { type: string, format: uuid }
+        code: { type: string, enum: [READ_ONLY, DOCUMENT_TOO_LARGE, MALFORMED_UPDATE, ACCESS_REVOKED] }
+        message: { type: string }
+    WsUpdateRemote:
+      type: object
+      required: [updateId, seq, userId, update]
+      properties:
+        updateId: { type: string, format: uuid }
+        seq: { type: integer, format: int64 }
+        userId: { type: string, format: uuid }
+        update: { type: string, format: byte }
+    WsAwareness:
+      type: object
+      required: [anchor, head, typing]
+      properties:
+        anchor: { type: string, format: byte, nullable: true, description: Y.RelativePosition (base64). }
+        head: { type: string, format: byte, nullable: true, description: Y.RelativePosition (base64). }
+        typing: { type: boolean }
+    WsAwarenessRemote:
+      allOf:
+        - $ref: '#/components/schemas/WsAwareness'
+        - type: object
+          required: [userId]
+          properties:
+            userId: { type: string, format: uuid }
+    WsParticipants:
+      type: object
+      required: [editors]
+      properties:
+        editors:
+          type: array
+          items:
+            allOf:
+              - $ref: '#/components/schemas/ActiveEditor'
+              - $ref: '#/components/schemas/WsAwareness'
+    WsDocumentRenamed:
+      type: object
+      required: [title]
+      properties:
+        title: { type: string, minLength: 1, maxLength: 100 }
+    WsAccessChanged:
+      type: object
+      required: [readOnly]
+      properties:
+        readOnly: { type: boolean }
+
+    # ------------------------------------------------------ broker events (6.6)
+    EventEnvelope:
+      type: object
+      description: |
+        Body of every event on `synq.events` / `synq.transient`. AMQP properties: message_id = eventId,
+        correlation_id = request correlation id, content_type application/json, persistent delivery.
+        Names follow `<aggregate>.<past-tense-verb>`; schemaVersion increases on breaking payload changes and
+        consumers accept both versions during upgrade.
+      required: [eventId, eventType, aggregateId, workspaceId, schemaVersion, occurredAtUtc, payload]
+      properties:
+        eventId: { type: string, format: uuid }
+        eventType:
+          type: string
+          enum:
+            - user.profile-updated
+            - workspace.member-added
+            - workspace.member-removed
+            - workspace.role-changed
+            - channel.created
+            - channel.updated
+            - channel.participant-added
+            - channel.participant-removed
+            - conversation.created
+            - message.created
+            - message.updated
+            - message.deleted
+            - reaction.changed
+            - read-cursor.updated
+            - document.created
+            - document.renamed
+            - document.deleted
+            - document.updated
+            - notification.created
+            - presence.changed
+            - document.awareness
+        aggregateId: { type: string, format: uuid }
+        workspaceId: { type: string, format: uuid, nullable: true, description: Null for user.profile-updated. }
+        schemaVersion: { type: integer, minimum: 1, example: 1 }
+        occurredAtUtc: { type: string, format: date-time }
+        payload:
+          oneOf:
+            - $ref: '#/components/schemas/EventUserProfileUpdated'
+            - $ref: '#/components/schemas/EventMembership'
+            - $ref: '#/components/schemas/EventChannelCreated'
+            - $ref: '#/components/schemas/EventChannelUpdated'
+            - $ref: '#/components/schemas/EventChannelParticipant'
+            - $ref: '#/components/schemas/EventConversationCreated'
+            - $ref: '#/components/schemas/EventMessageCreated'
+            - $ref: '#/components/schemas/EventMessageUpdated'
+            - $ref: '#/components/schemas/EventMessageDeleted'
+            - $ref: '#/components/schemas/EventReactionChanged'
+            - $ref: '#/components/schemas/EventReadCursorUpdated'
+            - $ref: '#/components/schemas/EventDocument'
+            - $ref: '#/components/schemas/EventDocumentUpdated'
+            - $ref: '#/components/schemas/Notification'
+            - $ref: '#/components/schemas/EventPresenceChanged'
+            - $ref: '#/components/schemas/EventDocumentAwareness'
+    EventUserProfileUpdated:
+      description: 'user.profile-updated | Auth → Messaging, Workspace, Search, Collaboration. Also published at registration (profileVersion 1)'
+      type: object
+      required: [userId, displayName, avatarVersion, profileVersion, email]
+      properties:
+        userId: { type: string, format: uuid }
+        displayName: { type: string }
+        avatarVersion: { type: integer, minimum: 0 }
+        email: { type: string, format: email }
+        profileVersion: { type: integer, minimum: 1, description: Increases on every profile change; apply only a higher value. }
+    EventMembership:
+      description: 'workspace.member-added (→ Messaging, Presence, Search) | workspace.member-removed (→ Messaging, Collaboration, Presence, Search, Notification) | workspace.role-changed (→ Messaging). Producer: Workspace. role omitted on member-removed.'
+      type: object
+      required: [userId, membershipVersion]
+      properties:
+        userId: { type: string, format: uuid }
+        role: { $ref: '#/components/schemas/WorkspaceRole' }
+        membershipVersion: { type: integer, format: int64, description: 'Monotonic per (workspace, user); apply only if higher.' }
+    EventChannelCreated:
+      description: 'channel.created | Workspace → Messaging (creates CHANNEL conversation), Search'
+      type: object
+      required: [channelId, name, visibility, participantUserIds]
+      properties:
+        channelId: { type: string, format: uuid }
+        name: { type: string }
+        visibility: { $ref: '#/components/schemas/ChannelVisibility' }
+        participantUserIds:
+          type: array
+          items: { type: string, format: uuid }
+    EventChannelUpdated:
+      description: 'channel.updated | Workspace → Messaging, Collaboration, Search'
+      type: object
+      required: [channelId, name, archived, channelVersion]
+      properties:
+        channelId: { type: string, format: uuid }
+        name: { type: string }
+        archived: { type: boolean }
+        channelVersion: { type: integer, format: int64 }
+    EventChannelParticipant:
+      description: 'channel.participant-added / channel.participant-removed | Workspace → Messaging, Collaboration, Search'
+      type: object
+      required: [channelId, userId, membershipVersion]
+      properties:
+        channelId: { type: string, format: uuid }
+        userId: { type: string, format: uuid }
+        membershipVersion: { type: integer, format: int64 }
+    EventConversationCreated:
+      description: 'conversation.created | Messaging → Search, Messaging live'
+      type: object
+      required: [conversationId, type, participantUserIds]
+      properties:
+        conversationId: { type: string, format: uuid }
+        type: { $ref: '#/components/schemas/ConversationType' }
+        participantUserIds:
+          type: array
+          items: { type: string, format: uuid }
+    EventMessageCreated:
+      description: 'message.created | Messaging → Messaging live, Search, Notification, File'
+      allOf:
+        - $ref: '#/components/schemas/Message'
+        - type: object
+          required: [participantUserIds]
+          properties:
+            participantUserIds:
+              type: array
+              items: { type: string, format: uuid }
+    EventMessageUpdated:
+      description: 'message.updated | Messaging → Messaging live, Search'
+      type: object
+      required: [messageId, conversationId, text, editVersion, mentionedUserIds]
+      properties:
+        messageId: { type: string, format: uuid }
+        conversationId: { type: string, format: uuid }
+        text: { type: string }
+        editVersion: { type: integer }
+        mentionedUserIds:
+          type: array
+          items: { type: string, format: uuid }
+    EventMessageDeleted:
+      description: 'message.deleted | Messaging → Messaging live, Search, Notification, File'
+      type: object
+      required: [messageId, conversationId, seq, attachmentFileIds, deletedBy]
+      properties:
+        messageId: { type: string, format: uuid }
+        conversationId: { type: string, format: uuid }
+        seq: { type: integer, format: int64 }
+        attachmentFileIds:
+          type: array
+          items: { type: string, format: uuid }
+        deletedBy: { type: string, enum: [AUTHOR, MODERATOR] }
+    EventReactionChanged:
+      description: 'reaction.changed | Messaging → Messaging live'
+      type: object
+      required: [messageId, conversationId, emoji, userId, added, counts]
+      properties:
+        messageId: { type: string, format: uuid }
+        conversationId: { type: string, format: uuid }
+        emoji: { type: string }
+        userId: { type: string, format: uuid }
+        added: { type: boolean }
+        counts:
+          type: object
+          additionalProperties: { type: integer }
+          example: { thumbs_up: 3, heart: 1 }
+    EventReadCursorUpdated:
+      description: 'read-cursor.updated | Messaging → Messaging live'
+      type: object
+      required: [userId, conversationId, lastReadSeq]
+      properties:
+        userId: { type: string, format: uuid }
+        conversationId: { type: string, format: uuid }
+        lastReadSeq: { type: integer, format: int64 }
+    EventDocument:
+      description: 'document.created (→ Messaging, posts the card) | document.renamed / document.deleted (→ Messaging, Collaboration live). Producer: Collaboration.'
+      type: object
+      required: [documentId, channelId, title]
+      properties:
+        documentId: { type: string, format: uuid }
+        channelId: { type: string, format: uuid }
+        title: { type: string }
+        createdBy: { type: string, format: uuid }
+    EventDocumentUpdated:
+      description: 'document.updated | Collaboration → Collaboration live'
+      type: object
+      required: [documentId, seq, updateId, userId, update]
+      properties:
+        documentId: { type: string, format: uuid }
+        seq: { type: integer, format: int64 }
+        updateId: { type: string, format: uuid }
+        userId: { type: string, format: uuid }
+        update: { type: string, format: byte }
+    EventPresenceChanged:
+      description: 'presence.changed (transient) | Presence → Messaging live'
+      type: object
+      required: [userId, status, workspaceIds]
+      properties:
+        userId: { type: string, format: uuid }
+        status: { type: string, enum: [ONLINE, OFFLINE] }
+        lastSeenAtUtc: { type: string, format: date-time, nullable: true }
+        workspaceIds:
+          type: array
+          items: { type: string, format: uuid }
+    EventDocumentAwareness:
+      description: 'document.awareness (transient) | Collaboration → Collaboration live'
+      allOf:
+        - $ref: '#/components/schemas/WsAwareness'
+        - type: object
+          required: [documentId, userId]
+          properties:
+            documentId: { type: string, format: uuid }
+            userId: { type: string, format: uuid }
