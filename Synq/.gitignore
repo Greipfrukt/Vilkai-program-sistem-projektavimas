@@ -1,0 +1,27 @@
+# .NET
+bin/
+obj/
+*.user
+*.suo
+.vs/
+TestResults/
+
+# Node / web
+node_modules/
+dist/
+*.local
+
+# iOS / Xcode
+DerivedData/
+xcuserdata/
+*.xcuserstate
+.build/
+.swiftpm/
+
+# Env
+.env
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/

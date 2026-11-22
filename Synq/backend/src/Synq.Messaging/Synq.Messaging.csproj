@@ -1,0 +1,6 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <!-- R-01–R-08 – Messaging Service (FR-011–019, 021), 2 instancijos -->
+  <ItemGroup>
+    <ProjectReference Include="../Synq.Common/Synq.Common.csproj" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,6 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <!-- A-07 – Search Service (FR-022, SHOULD) -->
+  <ItemGroup>
+    <ProjectReference Include="../Synq.Common/Synq.Common.csproj" />
+  </ItemGroup>
+</Project>
