@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <!-- P-04 – API gateway (YARP) -->
+  <ItemGroup>
+    <ProjectReference Include="../Synq.Common/Synq.Common.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Yarp.ReverseProxy" />
+  </ItemGroup>
+</Project>

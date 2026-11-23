@@ -1,0 +1,25 @@
+name: backend
+
+on:
+  pull_request:
+    paths: ["Synq/backend/**", ".github/workflows/backend.yml"]
+  push:
+    branches: [main]
+    paths: ["Synq/backend/**"]
+
+defaults:
+  run:
+    working-directory: Synq/backend
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: Synq/backend/global.json
+      - run: dotnet restore Synq.slnx
+      - run: dotnet build Synq.slnx --no-restore -c Release
+      # Testcontainers naudoja runner'io Docker'į
+      - run: dotnet test Synq.slnx --no-build -c Release

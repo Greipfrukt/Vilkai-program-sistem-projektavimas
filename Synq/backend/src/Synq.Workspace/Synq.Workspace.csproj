@@ -1,0 +1,6 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <!-- P-06–P-09 – Workspace Service (FR-004–010) -->
+  <ItemGroup>
+    <ProjectReference Include="../Synq.Common/Synq.Common.csproj" />
+  </ItemGroup>
+</Project>

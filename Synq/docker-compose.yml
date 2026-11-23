@@ -1,0 +1,115 @@
+# P-01 – visa Synq sistema.  Paleidimas:  cp .env.example .env && docker compose up --build
+x-service: &service
+  restart: unless-stopped
+  environment: &service-env
+    ASPNETCORE_ENVIRONMENT: Production
+    ConnectionStrings__Postgres: Host=postgres;Database=${POSTGRES_DB};Username=${POSTGRES_USER};Password=${POSTGRES_PASSWORD}
+    RabbitMq__Host: rabbitmq
+    RabbitMq__User: ${RABBITMQ_DEFAULT_USER}
+    RabbitMq__Password: ${RABBITMQ_DEFAULT_PASS}
+    Redis__Connection: redis:6379
+    Internal__Token: ${INTERNAL_TOKEN}
+  healthcheck:
+    test: ["CMD", "curl", "-fsS", "http://localhost:8080/health/ready"]
+    interval: 10s
+    timeout: 3s
+    retries: 10
+    start_period: 15s
+  depends_on: &infra-deps
+    postgres: { condition: service_healthy }
+    rabbitmq: { condition: service_healthy }
+    redis: { condition: service_healthy }
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  gateway:
+    <<: *service
+    build: { context: ./backend, dockerfile: src/Synq.Gateway/Dockerfile }
+    ports:
+      - "${GATEWAY_PORT:-8080}:8080"
+    depends_on:
+      <<: *infra-deps
+      auth: { condition: service_healthy }
+      workspace: { condition: service_healthy }
+      messaging-1: { condition: service_healthy }
+      messaging-2: { condition: service_healthy }
+
+  auth:
+    <<: *service
+    build: { context: ./backend, dockerfile: src/Synq.Auth/Dockerfile }
+    environment:
+      <<: *service-env
+      Cookie__Secure: ${COOKIE_SECURE:-true}
+
+  workspace:
+    <<: *service
+    build: { context: ./backend, dockerfile: src/Synq.Workspace/Dockerfile }
+
+  # Messaging – tas pats image, 2 instancijos
+  messaging-1:
+    <<: *service
+    image: synq/messaging:dev
+    build: { context: ./backend, dockerfile: src/Synq.Messaging/Dockerfile }
+    environment:
+      <<: *service-env
+      Messaging__InstanceId: messaging-1
+
+  messaging-2:
+    <<: *service
+    image: synq/messaging:dev
+    environment:
+      <<: *service-env
+      Messaging__InstanceId: messaging-2
+    depends_on:
+      <<: *infra-deps
+      messaging-1: { condition: service_started }
+
+  presence:
+    <<: *service
+    build: { context: ./backend, dockerfile: src/Synq.Presence/Dockerfile }
+
+  search:
+    <<: *service
+    build: { context: ./backend, dockerfile: src/Synq.Search/Dockerfile }
+
+  notification:
+    <<: *service
+    build: { context: ./backend, dockerfile: src/Synq.Notification/Dockerfile }
+
+volumes:
+  pgdata:

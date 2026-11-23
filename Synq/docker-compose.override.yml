@@ -1,0 +1,15 @@
+# P-01 – dev nustatymai (docker compose juos įkelia automatiškai kartu su docker-compose.yml).
+services:
+  postgres:
+    ports: ["5432:5432"]
+  rabbitmq:
+    ports: ["5672:5672", "15672:15672"]
+  redis:
+    ports: ["6379:6379"]
+  gateway:
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+  auth:
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      Cookie__Secure: "false"

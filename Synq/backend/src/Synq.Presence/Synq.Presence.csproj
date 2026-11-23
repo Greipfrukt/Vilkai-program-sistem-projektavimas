@@ -1,0 +1,6 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <!-- R-09 – Presence Service (FR-020) -->
+  <ItemGroup>
+    <ProjectReference Include="../Synq.Common/Synq.Common.csproj" />
+  </ItemGroup>
+</Project>
