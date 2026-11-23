@@ -32,8 +32,8 @@ Pasikeitus `Synq.yaml`: `npm run gen:api && npm run build`.
 
 ```sh
 cd backend
-dotnet build Synq.sln
-dotnet test Synq.sln      # integraciniams testams reikia veikiančio Docker
+dotnet build Synq.slnx
+dotnet test Synq.slnx      # integraciniams testams reikia veikiančio Docker
 ```
 
 ### iOS

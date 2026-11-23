@@ -1,0 +1,22 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Synq.Auth/Synq.Auth.csproj" />
+    <Project Path="src/Synq.Common/Synq.Common.csproj" />
+    <Project Path="src/Synq.Gateway/Synq.Gateway.csproj" />
+    <Project Path="src/Synq.Messaging/Synq.Messaging.csproj" />
+    <Project Path="src/Synq.Notification/Synq.Notification.csproj" />
+    <Project Path="src/Synq.Presence/Synq.Presence.csproj" />
+    <Project Path="src/Synq.Search/Synq.Search.csproj" />
+    <Project Path="src/Synq.Workspace/Synq.Workspace.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Synq.Auth.Tests/Synq.Auth.Tests.csproj" />
+    <Project Path="tests/Synq.Common.Tests/Synq.Common.Tests.csproj" />
+    <Project Path="tests/Synq.Messaging.Tests/Synq.Messaging.Tests.csproj" />
+    <Project Path="tests/Synq.Notification.Tests/Synq.Notification.Tests.csproj" />
+    <Project Path="tests/Synq.Presence.Tests/Synq.Presence.Tests.csproj" />
+    <Project Path="tests/Synq.Search.Tests/Synq.Search.Tests.csproj" />
+    <Project Path="tests/Synq.TestKit/Synq.TestKit.csproj" />
+    <Project Path="tests/Synq.Workspace.Tests/Synq.Workspace.Tests.csproj" />
+  </Folder>
+</Solution>

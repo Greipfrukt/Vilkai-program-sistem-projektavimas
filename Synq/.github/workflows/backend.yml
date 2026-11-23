@@ -19,7 +19,7 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           global-json-file: Synq/backend/global.json
-      - run: dotnet restore Synq.sln
-      - run: dotnet build Synq.sln --no-restore -c Release
+      - run: dotnet restore Synq.slnx
+      - run: dotnet build Synq.slnx --no-restore -c Release
       # Testcontainers naudoja runner'io Docker'į
-      - run: dotnet test Synq.sln --no-build -c Release
+      - run: dotnet test Synq.slnx --no-build -c Release
