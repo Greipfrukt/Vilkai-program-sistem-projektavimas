@@ -2,6 +2,7 @@
   <!-- P-02 – bendri Testcontainers fixture'ai (Postgres, RabbitMQ, Redis) -->
   <PropertyGroup>
     <IsPackable>false</IsPackable>
+    <IsTestProject>false</IsTestProject>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="xunit" />

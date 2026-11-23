@@ -6,7 +6,7 @@ Komanda: **Pijus** (infra, Auth, Workspace), **Rokas** (Messaging, Presence), **
 
 ## Paleidimas (≈10 min)
 
-Reikia: Docker Desktop, .NET 8 SDK (backend kūrimui), Node 22 (web).
+Reikia: Docker Desktop, .NET 10 SDK (backend kūrimui), Node 22 (web).
 
 ```sh
 cp .env.example .env
