@@ -1,13 +1,20 @@
 <Project Sdk="Microsoft.NET.Sdk">
-  <!-- P-02 – bendri Testcontainers fixture'ai (Postgres, RabbitMQ, Redis) -->
+  <!-- P-02 – bendri Testcontainers fixture'ai (Postgres, Redis) ir WebApplicationFactory servisams -->
   <PropertyGroup>
     <IsPackable>false</IsPackable>
     <IsTestProject>false</IsTestProject>
   </PropertyGroup>
   <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+  <ItemGroup>
     <PackageReference Include="xunit" />
+    <PackageReference Include="Microsoft.AspNetCore.Mvc.Testing" />
     <PackageReference Include="Testcontainers.PostgreSql" />
     <PackageReference Include="Testcontainers.RabbitMq" />
     <PackageReference Include="Testcontainers.Redis" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../src/Synq.Common/Synq.Common.csproj" />
   </ItemGroup>
 </Project>
